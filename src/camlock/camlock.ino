@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.3.0"
+#define FW_VERSION        "2.4.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -79,7 +79,7 @@
 enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
 enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
 enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
-enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2 };
+enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2, RF_PHOTO_PICK = 4, RF_PHOTO_RET = 8 };
 
 enum Verify      : uint8_t { VF_NONE = 0, VF_REJECTED = 1, VF_PENDING = 2, VF_OK = 3 };
 
@@ -563,6 +563,13 @@ void deletePhotos(int idx) {
   LittleFS.remove(photoPath(idx, "id")); LittleFS.remove(photoPath(idx, "selfie"));
 }
 
+// ---------- รูปหลักฐานตอนรับ/คืนกล้อง ----------
+String evidencePath(uint16_t rid, const String &kind) { return "/r" + String(rid) + (kind == "return" ? "_r.txt" : "_p.txt"); }
+void deleteEvidence(uint16_t rid) {
+  if (!fsOk || !rid) return;
+  LittleFS.remove(evidencePath(rid, "pickup")); LittleFS.remove(evidencePath(rid, "return"));
+}
+
 String userJson(int i) {
   User &u = users[i];
   int count = 0, late = 0; uint32_t hrs = 0;
@@ -590,7 +597,8 @@ String rentalJson(int i) {
          ",\"deposit\":" + String(r.deposit) + ",\"created\":" + String(r.created) + ",\"picked\":" + String(r.pickedAt) +
          ",\"due\":" + String(r.dueAt) + ",\"returned\":" + String(r.returnedAt) + ",\"amount\":" + String(r.amount) +
          ",\"paid\":" + String(r.paid) + ",\"lateFee\":" + String(r.lateFee) + ",\"refunded\":" + jbool(r.flags & RF_REFUNDED) +
-         ",\"notified\":" + jbool(r.flags & RF_PAY_NOTIFIED) + ",\"returning\":" + jbool(returningIdx == i) + "}";
+         ",\"notified\":" + jbool(r.flags & RF_PAY_NOTIFIED) +
+         ",\"photoPick\":" + jbool(r.flags & RF_PHOTO_PICK) + ",\"photoRet\":" + jbool(r.flags & RF_PHOTO_RET) + ",\"returning\":" + jbool(returningIdx == i) + "}";
 }
 
 int findRental(uint32_t id) {
@@ -746,6 +754,7 @@ void handleRent() {
 
   Camera &c = cams[cam];
   Rental &r = rentals[slot];
+  deleteEvidence(r.id);          // ทับรายการเก่า: ลบรูปหลักฐานของรายการนั้นด้วย
   memset(&r, 0, sizeof(Rental));
   r.id = nextRentalId++; r.user = u; r.cam = cam; r.hours = hours;
   r.price = c.price; r.deposit = c.deposit;
@@ -896,6 +905,7 @@ void handleAdminRental() {
     if (r.status == RS_ACTIVE || r.status == RS_READY) { sendErr(409, "ลบไม่ได้ รายการยังไม่จบ"); return; }
     if (r.status == RS_AWAIT || r.status == RS_VERIFY) freeCam = true;
     uint16_t id = r.id; uint8_t cam = r.cam;
+    deleteEvidence(id);
     memset(&r, 0, sizeof(Rental));
     if (freeCam && cam < MAX_CAMS && cams[cam].status == CAM_RENTED) { cams[cam].status = CAM_AVAILABLE; saveCams(); }
     saveRentals(); addLog("ผู้ดูแลลบรายการ #" + String(id)); sendOk("ลบแล้ว"); return;
@@ -1006,6 +1016,37 @@ void handleAdminUserPhoto() {
   sendJson(200, "{\"ok\":true,\"img\":\"" + img + "\"}");
 }
 
+// ผู้ใช้ส่งรูปหลักฐาน: kind = "pickup" (ตอนรับ) หรือ "return" (ตอนคืน)
+void handleEvidence() {
+  int u = requireUser(); if (u < 0) return;
+  int i = ownRental(u); if (i < 0) return;
+  Rental &r = rentals[i];
+  String kind = arg("kind"), img = arg("img");
+  if (kind != "pickup" && kind != "return") { sendErr(400, "ชนิดรูปไม่ถูกต้อง"); return; }
+  if (r.status != RS_ACTIVE && r.status != RS_RETURNED) { sendErr(409, "ส่งหลักฐานได้หลังเปิดตู้เท่านั้น"); return; }
+  if (!img.startsWith("data:image/jpeg;base64,") || img.length() > 20000) { sendErr(400, "รูปใหญ่เกินไปหรือไม่ใช่ JPEG"); return; }
+  if (!fsOk) { sendErr(500, "หน่วยความจำรูปของตู้ใช้ไม่ได้"); return; }
+  File f = LittleFS.open(evidencePath(r.id, kind), "w");
+  if (!f) { sendErr(500, "บันทึกรูปไม่ได้ (หน่วยความจำเต็ม?)"); return; }
+  size_t n = f.print(img); f.close();
+  if (n != img.length()) { LittleFS.remove(evidencePath(r.id, kind)); sendErr(500, "หน่วยความจำรูปเต็ม แจ้งผู้ดูแลให้ลบรายการเก่า"); return; }
+  r.flags |= (kind == "return") ? RF_PHOTO_RET : RF_PHOTO_PICK;
+  saveRentals();
+  addLog("รูปหลักฐาน" + String(kind == "return" ? "คืน" : "รับ") + " #" + String(r.id));
+  sendJson(200, "{\"ok\":true,\"rental\":" + rentalJson(i) + "}");
+}
+
+void handleAdminEvidence() {
+  if (requireAdmin() < 0) return;
+  int i = findRental(arg("rid").toInt());
+  if (i < 0) { sendErr(404, "ไม่พบรายการ"); return; }
+  String path = evidencePath(rentals[i].id, arg("kind"));
+  if (!fsOk || !LittleFS.exists(path)) { sendErr(404, "ไม่มีรูป"); return; }
+  File f = LittleFS.open(path, "r");
+  String img = f.readString(); f.close();
+  sendJson(200, "{\"ok\":true,\"img\":\"" + img + "\"}");
+}
+
 void handleAdminSettings() {
   if (requireAdmin() < 0) return;
   sendJson(200, "{\"ok\":true,\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
@@ -1078,6 +1119,7 @@ typedef void (*Handler)();
 struct Route { const char *method; Handler fn; };
 const Route ROUTES[] = {
   {"status", handleStatus},           {"getStatus", handleGetStatus},     {"lockNow", handleLockNow},
+  {"evidence", handleEvidence},       {"adminEvidence", handleAdminEvidence},
   {"verifyUpload", handleVerifyUpload}, {"verifySubmit", handleVerifySubmit}, {"adminUserPhoto", handleAdminUserPhoto},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
   {"pay", handlePayNotify},           {"cancel", handleCancel},           {"open", handleOpen},
