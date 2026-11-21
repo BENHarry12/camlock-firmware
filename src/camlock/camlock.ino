@@ -36,9 +36,15 @@
 #define TB_PORT           1883
 #define TB_TOKEN          "MTyY8KeuoPiXMB24eeWB"  // Access token ของอุปกรณ์ใน ThingsBoard
 #define LOCKER_ID         "A"
+
+// ยังไม่ได้ติด reed switch ให้ตั้งเป็น 0: ระบบจะถือว่าประตูเปิดตอนปลดล็อก
+// และปิด/ล็อกเองหลัง AUTO_CLOSE_MS (ผู้ใช้ต้องปิดประตูภายในเวลานี้)
+// ติด reed switch ที่ J4 แล้วค่อยเปลี่ยนเป็น 1
+#define HAS_REED_SWITCH   0
+#define AUTO_CLOSE_MS     10000
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.0.0"
+#define FW_VERSION        "2.1.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -341,12 +347,23 @@ bool defaultAdminPassword() {
 // ============================================================
 //  กลอนและประตู
 // ============================================================
+// สถานะประตู: อ่านจาก reed switch หรือจำลองจากเวลาปลดล็อก
+uint32_t virtualOpenUntil = 0;
+bool readDoorClosed() {
+#if HAS_REED_SWITCH
+  return digitalRead(PIN_DOOR) == DOOR_CLOSED_LEVEL;
+#else
+  return virtualOpenUntil == 0 || (int32_t)(millis() - virtualOpenUntil) >= 0;
+#endif
+}
+
 String unlockDoor(const String &who) {
   uint32_t now = millis();
   if (relayActive) return "กำลังปลดล็อกอยู่แล้ว";
   if (lastPulseAt && now - lastPulseAt < MIN_PULSE_GAP_MS) return "รอสักครู่แล้วลองใหม่";
   digitalWrite(PIN_RELAY, RELAY_ON);
   relayActive = true; relayOffAt = now + unlockMs; lastPulseAt = now; lastUnlockCmdAt = now;
+  virtualOpenUntil = now + AUTO_CLOSE_MS;
   totalUnlocks++;
   prefs.begin("camlock", false); prefs.putUInt("unlocks", totalUnlocks); prefs.end();
   addLog("ปลดล็อก โดย " + who);
@@ -374,7 +391,7 @@ void updateRelay() {
 }
 
 void updateDoor() {
-  bool raw = (digitalRead(PIN_DOOR) == DOOR_CLOSED_LEVEL);
+  bool raw = readDoorClosed();
   uint32_t now = millis();
   if (raw != doorRawLast) { doorRawLast = raw; doorChangedAt = now; }
   if (raw != doorClosed && now - doorChangedAt > 60) {
@@ -982,7 +999,8 @@ void publishAttributes() {
   String j = "{\"lockerId\":\"" LOCKER_ID "\",\"firmware\":\"" FW_VERSION "\",\"ip\":" + jstr(WiFi.localIP().toString()) +
              ",\"ssid\":" + jstr(WIFI_SSID) + ",\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
              ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
-             ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) + "}";
+             ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
+             ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(AUTO_CLOSE_MS / 1000) + "}";
   mqtt.publish("v1/devices/me/attributes", j.c_str());
   attributesDirty = false;
 }
@@ -1093,7 +1111,7 @@ void setup() {
   for (auto &s : sessions) s.user = -1;
   loadAll();
 
-  doorClosed = doorRawLast = (digitalRead(PIN_DOOR) == DOOR_CLOSED_LEVEL);
+  doorClosed = doorRawLast = readDoorClosed();
   doorOpenedAt = millis();
   addLog(String("เปิดเครื่อง ประตู") + (doorClosed ? "ปิดอยู่" : "เปิดอยู่"));
 
