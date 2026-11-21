@@ -68,6 +68,47 @@
 #define TELEMETRY_MS      10000UL
 #define MQTT_BUFFER       24576     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
 
+// ---------- โครงสร้างข้อมูล (ต้องอยู่ก่อนฟังก์ชันแรก เพราะ Arduino IDE สร้าง prototype ไว้ตรงนั้น) ----------
+enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
+enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
+enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
+enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2 };
+
+struct User {
+  char     sid[16];
+  char     name[48];
+  char     phone[16];
+  uint8_t  salt[8];
+  uint8_t  hash[32];
+  uint8_t  flags;
+  uint32_t created;
+};
+struct Camera {
+  uint8_t  used;
+  uint8_t  status;
+  char     name[40];
+  char     lens[40];
+  char     specs[72];     // คั่นด้วย |
+  uint16_t price;         // บาท/ชม.
+  uint16_t deposit;
+};
+struct Rental {
+  uint16_t id;
+  uint8_t  user;
+  uint8_t  cam;
+  uint8_t  status;
+  uint8_t  flags;
+  uint16_t hours;
+  uint16_t price;
+  uint16_t deposit;
+  uint32_t created, pickedAt, dueAt, returnedAt;
+  uint32_t amount;        // ยอดที่ต้องจ่ายทั้งหมด (ค่าเช่า + มัดจำ + ต่อเวลา + ค่าปรับ)
+  uint32_t paid;          // ยอดที่ผู้ดูแลยืนยันว่าได้รับแล้ว
+  uint32_t lateFee;
+};
+struct Session { char token[33]; int8_t user; uint32_t lastMs; };
+struct LogEntry { uint32_t epoch, ms; char msg[LOG_LEN]; };
+
 WiFiClient   net;
 PubSubClient mqtt(net);
 
@@ -135,45 +176,7 @@ void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
 // ============================================================
 //  โครงสร้างข้อมูล (เก็บถาวรใน flash)
 // ============================================================
-enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
-enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
-enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
-enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2 };
 
-struct User {
-  char     sid[16];
-  char     name[48];
-  char     phone[16];
-  uint8_t  salt[8];
-  uint8_t  hash[32];
-  uint8_t  flags;
-  uint32_t created;
-};
-struct Camera {
-  uint8_t  used;
-  uint8_t  status;
-  char     name[40];
-  char     lens[40];
-  char     specs[72];     // คั่นด้วย |
-  uint16_t price;         // บาท/ชม.
-  uint16_t deposit;
-};
-struct Rental {
-  uint16_t id;
-  uint8_t  user;
-  uint8_t  cam;
-  uint8_t  status;
-  uint8_t  flags;
-  uint16_t hours;
-  uint16_t price;
-  uint16_t deposit;
-  uint32_t created, pickedAt, dueAt, returnedAt;
-  uint32_t amount;        // ยอดที่ต้องจ่ายทั้งหมด (ค่าเช่า + มัดจำ + ต่อเวลา + ค่าปรับ)
-  uint32_t paid;          // ยอดที่ผู้ดูแลยืนยันว่าได้รับแล้ว
-  uint32_t lateFee;
-};
-struct Session { char token[33]; int8_t user; uint32_t lastMs; };
-struct LogEntry { uint32_t epoch, ms; char msg[LOG_LEN]; };
 
 // ---------------- ตัวแปรระบบ ----------------
 Preferences prefs;
