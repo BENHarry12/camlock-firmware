@@ -37,14 +37,13 @@
 #define TB_TOKEN          "MTyY8KeuoPiXMB24eeWB"  // Access token ของอุปกรณ์ใน ThingsBoard
 #define LOCKER_ID         "A"
 
-// ยังไม่ได้ติด reed switch ให้ตั้งเป็น 0: ระบบจะถือว่าประตูเปิดตอนปลดล็อก
-// และปิด/ล็อกเองหลัง AUTO_CLOSE_MS (ผู้ใช้ต้องปิดประตูภายในเวลานี้)
+// ยังไม่ได้ติด reed switch ให้ตั้งเป็น 0: ระบบถือว่าประตูเปิดตลอดที่กลอนปลดล็อก
+// และถือว่าปิดเมื่อกลอนล็อกกลับ (ผู้ใช้กด "ล็อกตู้" ในแอป หรือครบเวลาเปิดค้าง)
 // ติด reed switch ที่ J4 แล้วค่อยเปลี่ยนเป็น 1
 #define HAS_REED_SWITCH   0
-#define AUTO_CLOSE_MS     10000
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.1.0"
+#define FW_VERSION        "2.2.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -63,7 +62,8 @@
 #define MAX_LOG           50
 #define LOG_LEN           96
 #define MIN_PULSE_GAP_MS  2000
-#define MAX_UNLOCK_MS     8000      // จ่ายไฟกลอนนานสุด กันคอยล์ร้อน
+#define DEFAULT_HOLD_MS   30000     // กลอนเปิดค้างรอหยิบ/ใส่กล้อง (ผู้ใช้กด "ล็อกตู้" ในแอปให้ล็อกก่อนได้)
+#define MAX_UNLOCK_MS     60000     // เปิดค้างได้นานสุด กันคอยล์กลอนร้อน (เช็คสเปกกลอนของคุณ)
 #define FAIL_LIMIT        5
 #define LOCKOUT_MS        60000UL
 #define SESSION_TTL_MS    (12UL * 3600UL * 1000UL)
@@ -199,7 +199,7 @@ uint32_t totalUnlocks = 0;
 // การตั้งค่า
 String   lockerName, lockerLoc, lockerNote, promptpay;
 bool     requireApprove = true;
-uint16_t unlockMs = 3000, alarmSec = 60;
+uint16_t unlockMs = DEFAULT_HOLD_MS, alarmSec = 90;
 
 // สถานะฮาร์ดแวร์
 bool     relayActive = false;
@@ -293,7 +293,7 @@ void saveSettings() {
   prefs.begin("camlock", false);
   prefs.putString("lname", lockerName); prefs.putString("lloc", lockerLoc); prefs.putString("lnote", lockerNote);
   prefs.putString("pp", promptpay);    prefs.putBool("approve", requireApprove);
-  prefs.putUShort("unlockMs", unlockMs); prefs.putUShort("alarmSec", alarmSec);
+  prefs.putUShort("holdMs", unlockMs); prefs.putUShort("alarmSec", alarmSec);
   prefs.end();
 }
 
@@ -311,8 +311,8 @@ void loadAll() {
   lockerNote = prefs.getString("lnote", "หน้าห้องแล็บ · เปิด 24 ชม.");
   promptpay  = prefs.getString("pp", "");
   requireApprove = prefs.getBool("approve", true);
-  unlockMs   = prefs.getUShort("unlockMs", 3000);
-  alarmSec   = prefs.getUShort("alarmSec", 60);
+  unlockMs   = prefs.getUShort("holdMs", DEFAULT_HOLD_MS);
+  alarmSec   = prefs.getUShort("alarmSec", 90);
   nextRentalId = prefs.getUShort("nextRid", 1);
   totalUnlocks = prefs.getUInt("unlocks", 0);
   bool hasUsers = prefs.getBytesLength("users") == sizeof(users);
@@ -321,7 +321,7 @@ void loadAll() {
   if (hasCams)  prefs.getBytes("cams", cams, sizeof(cams));
   if (prefs.getBytesLength("rent") == sizeof(rentals)) prefs.getBytes("rent", rentals, sizeof(rentals));
   prefs.end();
-  if (unlockMs < 500 || unlockMs > MAX_UNLOCK_MS) unlockMs = 3000;
+  if (unlockMs < 3000 || unlockMs > MAX_UNLOCK_MS) unlockMs = DEFAULT_HOLD_MS;
   if (alarmSec < 10) alarmSec = 60;
 
   if (!hasUsers) {   // ครั้งแรก: สร้างบัญชีผู้ดูแล
@@ -363,7 +363,7 @@ String unlockDoor(const String &who) {
   if (lastPulseAt && now - lastPulseAt < MIN_PULSE_GAP_MS) return "รอสักครู่แล้วลองใหม่";
   digitalWrite(PIN_RELAY, RELAY_ON);
   relayActive = true; relayOffAt = now + unlockMs; lastPulseAt = now; lastUnlockCmdAt = now;
-  virtualOpenUntil = now + AUTO_CLOSE_MS;
+  virtualOpenUntil = relayOffAt;
   totalUnlocks++;
   prefs.begin("camlock", false); prefs.putUInt("unlocks", totalUnlocks); prefs.end();
   addLog("ปลดล็อก โดย " + who);
@@ -386,6 +386,13 @@ void finishReturn() {
   returningIdx = -1;
 }
 
+// ล็อกตู้ทันที (ผู้ใช้หยิบ/ใส่กล้องเสร็จแล้วกดในแอป)
+void lockNow(const String &who) {
+  if (relayActive) { digitalWrite(PIN_RELAY, RELAY_OFF); relayActive = false; telemetryDirty = true; }
+  if (virtualOpenUntil && (int32_t)(virtualOpenUntil - millis()) > 0) virtualOpenUntil = millis();
+  addLog("ล็อกตู้ โดย " + who);
+}
+
 void updateRelay() {
   if (relayActive && (int32_t)(millis() - relayOffAt) >= 0) { digitalWrite(PIN_RELAY, RELAY_OFF); relayActive = false; telemetryDirty = true; }
 }
@@ -402,6 +409,10 @@ void updateDoor() {
       bool authorized = lastUnlockCmdAt && (now - lastUnlockCmdAt < 15000);
       addLog(authorized ? "ประตูเปิด" : "⚠ ประตูถูกเปิดโดยไม่มีคำสั่งปลดล็อก");
       if (returningIdx >= 0) returningOpened = true;
+#if HAS_REED_SWITCH
+      // มี reed switch: ประตูเปิดแล้ว ไม่ต้องจ่ายไฟกลอนต่อ (ประตูปิดเมื่อไหร่ สลักเด้งล็อกเอง)
+      if (relayActive && (int32_t)(relayOffAt - now) > 1000) relayOffAt = now + 1000;
+#endif
     } else {
       addLog("ประตูปิด (เปิดไป " + String((now - doorOpenedAt) / 1000) + " วินาที)");
       doorAlarm = false;
@@ -922,7 +933,7 @@ void handleAdminSettingsSave() {
   if (requireAdmin() < 0) return;
   if (hasArg("unlockMs")) {
     long v = arg("unlockMs").toInt();
-    if (v < 500 || v > MAX_UNLOCK_MS) { sendErr(400, "เวลาปลดล็อกต้องอยู่ระหว่าง 0.5–8 วินาที"); return; }
+    if (v < 3000 || v > MAX_UNLOCK_MS) { sendErr(400, "เวลาเปิดค้างต้องอยู่ระหว่าง 3–60 วินาที"); return; }
     unlockMs = v;
   }
   if (hasArg("alarmSec")) {
@@ -966,6 +977,13 @@ void handleAdminLog() {
 // ============================================================
 
 
+// lockNow: ผู้ใช้ที่เข้าสู่ระบบกดล็อกตู้หลังหยิบ/ใส่กล้องเสร็จ
+void handleLockNow() {
+  int u = requireUser(); if (u < 0) return;
+  lockNow(users[u].sid);
+  sendOk("ล็อกตู้แล้ว");
+}
+
 // getStatus: คงไว้ให้วิดเจ็ตบนแดชบอร์ด ThingsBoard เดิมใช้ได้
 void handleGetStatus() {
   sendJson(200, String("{\"ok\":true,\"doorOpen\":") + jbool(!doorClosed) + ",\"lockActive\":" + jbool(relayActive) + "}");
@@ -974,7 +992,7 @@ void handleGetStatus() {
 typedef void (*Handler)();
 struct Route { const char *method; Handler fn; };
 const Route ROUTES[] = {
-  {"status", handleStatus},           {"getStatus", handleGetStatus},           {"register", handleRegister},       {"login", handleLogin},
+  {"status", handleStatus},           {"getStatus", handleGetStatus},     {"lockNow", handleLockNow},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
   {"pay", handlePayNotify},           {"cancel", handleCancel},           {"open", handleOpen},
   {"extend", handleExtend},           {"password", handlePassword},
@@ -1000,7 +1018,7 @@ void publishAttributes() {
              ",\"ssid\":" + jstr(WIFI_SSID) + ",\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
              ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
              ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
-             ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(AUTO_CLOSE_MS / 1000) + "}";
+             ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(unlockMs / 1000) + "}";
   mqtt.publish("v1/devices/me/attributes", j.c_str());
   attributesDirty = false;
 }
