@@ -24,6 +24,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
 #include <time.h>
@@ -43,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.2.0"
+#define FW_VERSION        "2.3.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -72,7 +73,7 @@
 #define LATE_GRACE_SEC    (10 * 60)
 #define WDT_TIMEOUT_S     15
 #define TELEMETRY_MS      10000UL
-#define MQTT_BUFFER       24576     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
+#define MQTT_BUFFER       28672     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
 
 // ---------- โครงสร้างข้อมูล (ต้องอยู่ก่อนฟังก์ชันแรก เพราะ Arduino IDE สร้าง prototype ไว้ตรงนั้น) ----------
 enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
@@ -80,7 +81,20 @@ enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
 enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
 enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2 };
 
+enum Verify      : uint8_t { VF_NONE = 0, VF_REJECTED = 1, VF_PENDING = 2, VF_OK = 3 };
+
 struct User {
+  char     sid[16];        // ชื่อผู้ใช้ (ใช้เข้าสู่ระบบ)
+  char     name[48];
+  char     phone[16];
+  char     studentId[16];  // ไม่บังคับ
+  uint8_t  salt[8];
+  uint8_t  hash[32];
+  uint8_t  flags;
+  uint8_t  verify;         // สถานะยืนยันตัวตน
+  uint32_t created;
+};
+struct UserV1 {            // รูปแบบเก่า (v2.0–2.2) ใช้ย้ายข้อมูลอัตโนมัติ
   char     sid[16];
   char     name[48];
   char     phone[16];
@@ -122,7 +136,7 @@ PubSubClient mqtt(net);
 #if ARDUINOJSON_VERSION_MAJOR >= 7
 JsonDocument reqDoc;
 #else
-DynamicJsonDocument reqDoc(4096);
+DynamicJsonDocument reqDoc(24576);   // รองรับรูปยืนยันตัวตน ~20KB
 #endif
 JsonVariantConst REQ;
 
@@ -315,19 +329,33 @@ void loadAll() {
   alarmSec   = prefs.getUShort("alarmSec", 90);
   nextRentalId = prefs.getUShort("nextRid", 1);
   totalUnlocks = prefs.getUInt("unlocks", 0);
-  bool hasUsers = prefs.getBytesLength("users") == sizeof(users);
+  size_t ulen = prefs.getBytesLength("users");
+  bool hasUsers = ulen == sizeof(users), migrated = false;
+  if (!hasUsers && ulen == sizeof(UserV1) * MAX_USERS) {     // ย้ายข้อมูลสมาชิกจากเวอร์ชันเก่า
+    UserV1 *old = new UserV1[MAX_USERS];
+    prefs.getBytes("users", old, ulen);
+    for (int i = 0; i < MAX_USERS; i++) {
+      memcpy(users[i].sid, old[i].sid, 16); memcpy(users[i].name, old[i].name, 48); memcpy(users[i].phone, old[i].phone, 16);
+      memcpy(users[i].salt, old[i].salt, 8); memcpy(users[i].hash, old[i].hash, 32);
+      users[i].flags = old[i].flags; users[i].created = old[i].created;
+      users[i].verify = (old[i].flags & UF_USED) ? VF_OK : VF_NONE;   // สมาชิกเดิมถือว่ายืนยันแล้ว
+    }
+    delete[] old;
+    hasUsers = migrated = true;
+  }
   bool hasCams  = prefs.getBytesLength("cams") == sizeof(cams);
-  if (hasUsers) prefs.getBytes("users", users, sizeof(users));
+  if (hasUsers && !migrated) prefs.getBytes("users", users, sizeof(users));
   if (hasCams)  prefs.getBytes("cams", cams, sizeof(cams));
   if (prefs.getBytesLength("rent") == sizeof(rentals)) prefs.getBytes("rent", rentals, sizeof(rentals));
   prefs.end();
   if (unlockMs < 3000 || unlockMs > MAX_UNLOCK_MS) unlockMs = DEFAULT_HOLD_MS;
   if (alarmSec < 10) alarmSec = 60;
 
+  if (migrated) saveUsers();
   if (!hasUsers) {   // ครั้งแรก: สร้างบัญชีผู้ดูแล
     User &a = users[0];
     copyStr(a.sid, sizeof(a.sid), ADMIN_SID); copyStr(a.name, sizeof(a.name), "ผู้ดูแลระบบ");
-    a.flags = UF_USED | UF_ADMIN; setPassword(a, ADMIN_DEFAULT_PW);
+    a.flags = UF_USED | UF_ADMIN; a.verify = VF_OK; setPassword(a, ADMIN_DEFAULT_PW);
     saveUsers();
   }
   if (!hasCams) {    // ครั้งแรก: ใส่กล้องตัวอย่าง แก้/ลบได้ในหน้าผู้ดูแล
@@ -525,6 +553,16 @@ const char *rentStatusName(uint8_t s) {
 }
 const char *camStatusName(uint8_t s) { return s == CAM_RENTED ? "rented" : s == CAM_MAINT ? "maint" : "available"; }
 
+const char *verifyName(uint8_t v) { return v == VF_OK ? "ok" : v == VF_PENDING ? "pending" : v == VF_REJECTED ? "rejected" : "none"; }
+
+// ---------- รูปยืนยันตัวตน เก็บใน LittleFS (ลบทิ้งเมื่อผู้ดูแลอนุมัติ/ปฏิเสธ) ----------
+bool fsOk = false;
+String photoPath(int idx, const String &kind) { return "/v" + String(idx) + (kind == "id" ? "_id.txt" : "_sf.txt"); }
+void deletePhotos(int idx) {
+  if (!fsOk) return;
+  LittleFS.remove(photoPath(idx, "id")); LittleFS.remove(photoPath(idx, "selfie"));
+}
+
 String userJson(int i) {
   User &u = users[i];
   int count = 0, late = 0; uint32_t hrs = 0;
@@ -533,6 +571,7 @@ String userJson(int i) {
     if (r.lateFee) late++;
   }
   return "{\"idx\":" + String(i) + ",\"sid\":" + jstr(u.sid) + ",\"name\":" + jstr(u.name) + ",\"phone\":" + jstr(u.phone) +
+         ",\"studentId\":" + jstr(u.studentId) + ",\"verify\":\"" + verifyName(u.verify) + "\"" +
          ",\"admin\":" + jbool(u.flags & UF_ADMIN) + ",\"disabled\":" + jbool(u.flags & UF_DISABLED) +
          ",\"created\":" + String(u.created) + ",\"rentals\":" + String(count) + ",\"hours\":" + String(hrs) + ",\"late\":" + String(late) + "}";
 }
@@ -608,20 +647,23 @@ void handleRegister() {
   String name = arg("name"); name.trim();
   String phone = arg("phone"); phone.trim();
   String pw = arg("pass");
-  if (!validSid(sid)) { sendErr(400, "รหัสนักศึกษาต้องเป็นตัวเลข/อักษรอังกฤษ 3–15 ตัว"); return; }
+  String stu = arg("studentId"); stu.trim();
+  if (!validSid(sid)) { sendErr(400, "ชื่อผู้ใช้ต้องเป็นอักษรอังกฤษ/ตัวเลข 3–15 ตัว (ใช้ _ หรือ - ได้)"); return; }
+  if (stu.length() > 15) { sendErr(400, "รหัสนักศึกษายาวเกินไป"); return; }
   if (name.length() < 2) { sendErr(400, "กรุณาใส่ชื่อ-นามสกุล"); return; }
   if (phone.length() < 9) { sendErr(400, "กรุณาใส่เบอร์โทร"); return; }
   if (pw.length() < 6) { sendErr(400, "รหัสผ่านอย่างน้อย 6 ตัว"); return; }
   int slot = -1;
   for (int i = 0; i < MAX_USERS; i++) {
-    if ((users[i].flags & UF_USED) && sid == users[i].sid) { sendErr(409, "รหัสนี้สมัครไว้แล้ว"); return; }
+    if ((users[i].flags & UF_USED) && sid == users[i].sid) { sendErr(409, "ชื่อผู้ใช้นี้มีคนใช้แล้ว"); return; }
     if (slot < 0 && !(users[i].flags & UF_USED)) slot = i;
   }
   if (slot < 0) { sendErr(409, "สมาชิกเต็มแล้ว ติดต่อผู้ดูแล"); return; }
   User &u = users[slot];
   memset(&u, 0, sizeof(User));
   copyStr(u.sid, sizeof(u.sid), sid); copyStr(u.name, sizeof(u.name), name); copyStr(u.phone, sizeof(u.phone), phone);
-  u.flags = UF_USED; u.created = nowEpoch();
+  copyStr(u.studentId, sizeof(u.studentId), stu);
+  u.flags = UF_USED; u.verify = VF_NONE; u.created = nowEpoch();
   setPassword(u, pw);
   saveUsers();
   addLog("สมัครสมาชิกใหม่: " + sid);
@@ -652,7 +694,7 @@ void handleLogin() {
   loginFails++;
   addLog("เข้าสู่ระบบไม่สำเร็จ: " + sid);
   if (loginFails >= FAIL_LIMIT) { loginLockUntil = now + LOCKOUT_MS; loginFails = 0; addLog("⚠ ล็อกการเข้าสู่ระบบ 60 วินาที"); }
-  sendErr(403, "รหัสนักศึกษาหรือรหัสผ่านไม่ถูกต้อง");
+  sendErr(403, "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง");
 }
 
 void handleLogout() {
@@ -682,6 +724,9 @@ void handleMe() {
 void handleRent() {
   int u = requireUser(); if (u < 0) return;
   if (!timeSynced()) { sendErr(503, "ตู้ยังไม่ได้ตั้งเวลา ลองรีเฟรชหน้าแล้วลองใหม่"); return; }
+  if (!(users[u].flags & UF_ADMIN) && users[u].verify != VF_OK) {
+    sendErr(403, users[u].verify == VF_PENDING ? "รอผู้ดูแลตรวจการยืนยันตัวตน" : "กรุณายืนยันตัวตนก่อนเช่า"); return;
+  }
   if (openRentalOf(u) >= 0) { sendErr(409, "คุณมีรายการเช่าที่ยังไม่จบอยู่แล้ว"); return; }
   long cam = arg("cam").toInt(), hours = arg("hours").toInt();
   if (cam < 0 || cam >= MAX_CAMS || !cams[cam].used) { sendErr(404, "ไม่พบกล้อง"); return; }
@@ -907,18 +952,58 @@ void handleAdminUser() {
   else if (act == "enable") u.flags &= ~UF_DISABLED;
   else if (act == "admin") u.flags |= UF_ADMIN;
   else if (act == "unadmin") u.flags &= ~UF_ADMIN;
+  else if (act == "approve") { u.verify = VF_OK; deletePhotos(idx); }
+  else if (act == "reject")  { u.verify = VF_REJECTED; deletePhotos(idx); }
   else if (act == "password") {
     String p = arg("pass");
     if (p.length() < 4) { sendErr(400, "รหัสผ่านใหม่สั้นเกินไป"); return; }
     setPassword(u, p); dropSessionsOf(idx);
   } else if (act == "delete") {
     if (openRentalOf(idx) >= 0) { sendErr(409, "สมาชิกมีรายการเช่าค้างอยู่"); return; }
-    dropSessionsOf(idx); addLog(String("ลบสมาชิก: ") + u.sid);
+    dropSessionsOf(idx); deletePhotos(idx); addLog(String("ลบสมาชิก: ") + u.sid);
     memset(&u, 0, sizeof(User)); saveUsers(); sendOk("ลบแล้ว"); return;
   } else { sendErr(400, "คำสั่งไม่ถูกต้อง"); return; }
   saveUsers();
   addLog("ผู้ดูแล " + act + " สมาชิก " + String(u.sid));
   sendOk("บันทึกแล้ว");
+}
+
+// ---------- ยืนยันตัวตน ----------
+// ส่งรูปทีละรูป: kind = "id" (บัตร) หรือ "selfie" · img = data URL JPEG ที่แอปย่อขนาดแล้ว
+void handleVerifyUpload() {
+  int u = requireUser(); if (u < 0) return;
+  if (!fsOk) { sendErr(500, "หน่วยความจำรูปของตู้ใช้ไม่ได้"); return; }
+  if (users[u].verify == VF_OK) { sendOk("ยืนยันตัวตนแล้ว"); return; }
+  String kind = arg("kind"), img = arg("img");
+  if (kind != "id" && kind != "selfie") { sendErr(400, "ชนิดรูปไม่ถูกต้อง"); return; }
+  if (!img.startsWith("data:image/jpeg;base64,") || img.length() > 20000) { sendErr(400, "รูปใหญ่เกินไปหรือไม่ใช่ JPEG"); return; }
+  File f = LittleFS.open(photoPath(u, kind), "w");
+  if (!f) { sendErr(500, "บันทึกรูปไม่ได้"); return; }
+  f.print(img); f.close();
+  sendOk("อัปโหลดแล้ว");
+}
+
+void handleVerifySubmit() {
+  int u = requireUser(); if (u < 0) return;
+  if (users[u].verify == VF_OK) { sendOk("ยืนยันตัวตนแล้ว"); return; }
+  if (!fsOk || !LittleFS.exists(photoPath(u, "id")) || !LittleFS.exists(photoPath(u, "selfie"))) { sendErr(400, "กรุณาถ่ายรูปบัตรและรูปหน้าให้ครบ"); return; }
+  String stu = arg("studentId"); stu.trim();
+  if (stu.length() && stu.length() <= 15) copyStr(users[u].studentId, sizeof(users[u].studentId), stu);
+  users[u].verify = VF_PENDING;
+  saveUsers();
+  addLog(String("ส่งยืนยันตัวตน: ") + users[u].sid);
+  sendJson(200, "{\"ok\":true,\"user\":" + userJson(u) + "}");
+}
+
+void handleAdminUserPhoto() {
+  if (requireAdmin() < 0) return;
+  long idx = arg("idx").toInt();
+  if (idx < 0 || idx >= MAX_USERS || !(users[idx].flags & UF_USED)) { sendErr(404, "ไม่พบสมาชิก"); return; }
+  String path = photoPath(idx, arg("kind"));
+  if (!fsOk || !LittleFS.exists(path)) { sendErr(404, "ไม่มีรูป"); return; }
+  File f = LittleFS.open(path, "r");
+  String img = f.readString(); f.close();
+  sendJson(200, "{\"ok\":true,\"img\":\"" + img + "\"}");
 }
 
 void handleAdminSettings() {
@@ -992,7 +1077,8 @@ void handleGetStatus() {
 typedef void (*Handler)();
 struct Route { const char *method; Handler fn; };
 const Route ROUTES[] = {
-  {"status", handleStatus},           {"getStatus", handleGetStatus},     {"lockNow", handleLockNow},           {"register", handleRegister},       {"login", handleLogin},
+  {"status", handleStatus},           {"getStatus", handleGetStatus},     {"lockNow", handleLockNow},
+  {"verifyUpload", handleVerifyUpload}, {"verifySubmit", handleVerifySubmit}, {"adminUserPhoto", handleAdminUserPhoto},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
   {"pay", handlePayNotify},           {"cancel", handleCancel},           {"open", handleOpen},
   {"extend", handleExtend},           {"password", handlePassword},
@@ -1127,7 +1213,9 @@ void setup() {
   Serial.println("\n=== CamLock v" FW_VERSION " · ตู้ " LOCKER_ID " ===");
   setupWatchdog();
   for (auto &s : sessions) s.user = -1;
+  fsOk = LittleFS.begin(true);   // true = ฟอร์แมตให้ถ้ายังไม่เคยใช้
   loadAll();
+  if (!fsOk) addLog("⚠ LittleFS ใช้ไม่ได้ (เลือก Partition Scheme ที่มี SPIFFS)");
 
   doorClosed = doorRawLast = readDoorClosed();
   doorOpenedAt = millis();

@@ -61,7 +61,8 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 
 1. Arduino IDE → Boards Manager → **esp32 by Espressif** (core 2.x หรือ 3.x) → บอร์ด **ESP32 Dev Module**
 2. Library Manager → ติดตั้ง **PubSubClient** (Nick O'Leary) และ **ArduinoJson** (Benoit Blanchon รุ่น 6 หรือ 7)
-3. เปิด `src/camlock/camlock.ino` แก้ส่วน "ตั้งค่าตรงนี้"
+3. Tools → Partition Scheme → **Default 4MB with spiffs** (ใช้เก็บรูปยืนยันตัวตนชั่วคราว)
+4. เปิด `src/camlock/camlock.ino` แก้ส่วน "ตั้งค่าตรงนี้"
 
 ```cpp
 #define WIFI_SSID  "ESP_CAMLOCK"
@@ -88,8 +89,11 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 |---|---|---|---|
 | `status` | ทุกคน | – | สถานะตู้ทั้งหมด |
 | `getStatus` | ทุกคน | – | `{doorOpen, lockActive}` (รูปแบบเดิม ใช้กับวิดเจ็ตแดชบอร์ด) |
-| `register` | ทุกคน | sid, name, phone, pass | สมัครสมาชิก (ได้ token กลับ) |
-| `login` | ทุกคน | sid, pass | เข้าสู่ระบบ (ได้ token กลับ) |
+| `register` | ทุกคน | sid (ชื่อผู้ใช้), name, phone, studentId?, pass | สมัครสมาชิก (ได้ token กลับ) |
+| `login` | ทุกคน | sid (ชื่อผู้ใช้), pass | เข้าสู่ระบบ (ได้ token กลับ) |
+| `verifyUpload` | ผู้ใช้ | t, kind (id/selfie), img | ส่งรูปบัตร/รูปหน้า (JPEG data URL < 20KB) |
+| `verifySubmit` | ผู้ใช้ | t, studentId? | ส่งให้ผู้ดูแลตรวจการยืนยันตัวตน |
+| `adminUserPhoto` | ผู้ดูแล | t, idx, kind | ดูรูปยืนยันตัวตน |
 | `logout` | ผู้ใช้ | t | ออกจากระบบ |
 | `me` | ผู้ใช้ | t | ข้อมูลตัวเอง รายการเช่า และกล้อง |
 | `rent` | ผู้ใช้ | t, cam, hours | จองกล้อง |
@@ -104,7 +108,7 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 | `adminRental` | ผู้ดูแล | t, rid, action | confirm / reject / cancel / returned / refund / delete |
 | `adminCamera` | ผู้ดูแล | t, id?, name, lens, specs, price, deposit, status | เพิ่ม/แก้กล้อง |
 | `adminCameraDelete` | ผู้ดูแล | t, id | ลบกล้อง |
-| `adminUser` | ผู้ดูแล | t, idx, action, pass? | disable / enable / admin / unadmin / password / delete |
+| `adminUser` | ผู้ดูแล | t, idx, action, pass? | approve / reject (ยืนยันตัวตน) / disable / enable / admin / unadmin / password / delete |
 | `adminSettings` / `adminSettingsSave` | ผู้ดูแล | t, lockerName, lockerLoc, lockerNote, promptpay, approve, unlockMs, alarmSec | อ่าน/บันทึกการตั้งค่า |
 | `adminLog` | ผู้ดูแล | t | บันทึกการทำงาน 50 รายการล่าสุด |
 
@@ -119,6 +123,9 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 - **Client attributes:** `lockerId`, `firmware`, `ip`, `ssid`, `lockerName`, `lockerLoc`, `lockerNote`, `promptpay`, `approve`, `unlockMs`
 
 ## ขั้นตอนการเช่า (สถานะในบอร์ด)
+
+**ยืนยันตัวตน:** สมัครด้วยชื่อผู้ใช้ (รหัสนักศึกษาไม่บังคับ) → ถ่ายรูปบัตร + รูปหน้า → ผู้ดูแลอนุมัติ → จึงเช่าได้
+รูปเก็บใน LittleFS ของบอร์ด และ **ลบทันที** เมื่อผู้ดูแลกดอนุมัติหรือปฏิเสธ
 
 `await` รอชำระ → `verify` แจ้งโอนแล้ว รอผู้ดูแลยืนยัน → `ready` พร้อมรับ → `active` กำลังเช่า (เริ่มนับเวลาตอนเปิดตู้) → `returned` คืนแล้ว (บันทึกเองเมื่อ reed switch บอกว่าปิดประตู)
 
