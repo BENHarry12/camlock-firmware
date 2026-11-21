@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.4.0"
+#define FW_VERSION        "2.5.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -56,10 +56,10 @@
 #define RELAY_OFF         LOW
 #define DOOR_CLOSED_LEVEL LOW
 
-#define MAX_USERS         30
+#define MAX_USERS         60
 #define MAX_CAMS          8
 #define MAX_RENTALS       40
-#define MAX_SESSIONS      10
+#define MAX_SESSIONS      60
 #define MAX_LOG           50
 #define LOG_LEN           96
 #define MIN_PULSE_GAP_MS  2000
@@ -73,7 +73,7 @@
 #define LATE_GRACE_SEC    (10 * 60)
 #define WDT_TIMEOUT_S     15
 #define TELEMETRY_MS      10000UL
-#define MQTT_BUFFER       28672     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
+#define MQTT_BUFFER       49152     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
 
 // ---------- โครงสร้างข้อมูล (ต้องอยู่ก่อนฟังก์ชันแรก เพราะ Arduino IDE สร้าง prototype ไว้ตรงนั้น) ----------
 enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
@@ -209,6 +209,7 @@ LogEntry logs[MAX_LOG];
 uint8_t  logHead = 0, logCount = 0;
 uint16_t nextRentalId = 1;
 uint32_t totalUnlocks = 0;
+bool     fsOk = false;          // LittleFS พร้อมใช้
 
 // การตั้งค่า
 String   lockerName, lockerLoc, lockerNote, promptpay;
@@ -300,7 +301,19 @@ bool checkPassword(const User &u, const String &pw) {
 // ============================================================
 //  บันทึก / โหลด
 // ============================================================
-void saveUsers()   { prefs.begin("camlock", false); prefs.putBytes("users", users, sizeof(users)); prefs.end(); }
+// สมาชิกเก็บเป็นไฟล์ใน LittleFS (ใหญ่เกินกว่าจะเขียนซ้ำใน NVS ได้ปลอดภัย)
+void saveUsers() {
+  if (fsOk) {
+    File f = LittleFS.open("/users.tmp", "w");
+    if (f) {
+      size_t n = f.write((const uint8_t *)users, sizeof(users)); f.close();
+      if (n == sizeof(users)) { LittleFS.remove("/users.bin"); LittleFS.rename("/users.tmp", "/users.bin"); return; }
+    }
+    addLog("⚠ บันทึกสมาชิกลงไฟล์ไม่สำเร็จ");
+    return;
+  }
+  prefs.begin("camlock", false); prefs.putBytes("users", users, sizeof(users)); prefs.end();
+}
 void saveCams()    { prefs.begin("camlock", false); prefs.putBytes("cams", cams, sizeof(cams)); prefs.end(); }
 void saveRentals() { prefs.begin("camlock", false); prefs.putBytes("rent", rentals, sizeof(rentals)); prefs.putUShort("nextRid", nextRentalId); prefs.end(); }
 void saveSettings() {
@@ -329,22 +342,33 @@ void loadAll() {
   alarmSec   = prefs.getUShort("alarmSec", 90);
   nextRentalId = prefs.getUShort("nextRid", 1);
   totalUnlocks = prefs.getUInt("unlocks", 0);
+  // โหลดสมาชิก: รองรับจำนวนช่องเดิมที่น้อยกว่า และรูปแบบเก่า (UserV1) — ไม่ทำข้อมูลหาย
   size_t ulen = prefs.getBytesLength("users");
-  bool hasUsers = ulen == sizeof(users), migrated = false;
-  if (!hasUsers && ulen == sizeof(UserV1) * MAX_USERS) {     // ย้ายข้อมูลสมาชิกจากเวอร์ชันเก่า
-    UserV1 *old = new UserV1[MAX_USERS];
+  bool hasUsers = false, migrated = false, fromNvs = false;
+  if (fsOk && LittleFS.exists("/users.bin")) {
+    File f = LittleFS.open("/users.bin", "r");
+    size_t n = f.size();
+    if (n && n % sizeof(User) == 0 && n <= sizeof(users)) { f.read((uint8_t *)users, n); hasUsers = true; migrated = n != sizeof(users); }
+    f.close();
+  }
+  if (hasUsers) { /* โหลดจากไฟล์แล้ว */ }
+  else if (ulen && ulen % sizeof(User) == 0 && ulen <= sizeof(users) && ulen != 30 * sizeof(UserV1)) {
+    prefs.getBytes("users", users, ulen);
+    hasUsers = true; migrated = true; fromNvs = true;
+  } else if (ulen && ulen % sizeof(UserV1) == 0 && ulen / sizeof(UserV1) <= MAX_USERS) {
+    int n = ulen / sizeof(UserV1);
+    UserV1 *old = new UserV1[n];
     prefs.getBytes("users", old, ulen);
-    for (int i = 0; i < MAX_USERS; i++) {
+    for (int i = 0; i < n; i++) {
       memcpy(users[i].sid, old[i].sid, 16); memcpy(users[i].name, old[i].name, 48); memcpy(users[i].phone, old[i].phone, 16);
       memcpy(users[i].salt, old[i].salt, 8); memcpy(users[i].hash, old[i].hash, 32);
       users[i].flags = old[i].flags; users[i].created = old[i].created;
       users[i].verify = (old[i].flags & UF_USED) ? VF_OK : VF_NONE;   // สมาชิกเดิมถือว่ายืนยันแล้ว
     }
     delete[] old;
-    hasUsers = migrated = true;
+    hasUsers = migrated = fromNvs = true;
   }
   bool hasCams  = prefs.getBytesLength("cams") == sizeof(cams);
-  if (hasUsers && !migrated) prefs.getBytes("users", users, sizeof(users));
   if (hasCams)  prefs.getBytes("cams", cams, sizeof(cams));
   if (prefs.getBytesLength("rent") == sizeof(rentals)) prefs.getBytes("rent", rentals, sizeof(rentals));
   prefs.end();
@@ -352,6 +376,7 @@ void loadAll() {
   if (alarmSec < 10) alarmSec = 60;
 
   if (migrated) saveUsers();
+  if (fromNvs && fsOk) { prefs.begin("camlock", false); prefs.remove("users"); prefs.end(); }   // ย้ายไปไฟล์แล้ว คืนที่ NVS
   if (!hasUsers) {   // ครั้งแรก: สร้างบัญชีผู้ดูแล
     User &a = users[0];
     copyStr(a.sid, sizeof(a.sid), ADMIN_SID); copyStr(a.name, sizeof(a.name), "ผู้ดูแลระบบ");
@@ -556,7 +581,6 @@ const char *camStatusName(uint8_t s) { return s == CAM_RENTED ? "rented" : s == 
 const char *verifyName(uint8_t v) { return v == VF_OK ? "ok" : v == VF_PENDING ? "pending" : v == VF_REJECTED ? "rejected" : "none"; }
 
 // ---------- รูปยืนยันตัวตน เก็บใน LittleFS (ลบทิ้งเมื่อผู้ดูแลอนุมัติ/ปฏิเสธ) ----------
-bool fsOk = false;
 String photoPath(int idx, const String &kind) { return "/v" + String(idx) + (kind == "id" ? "_id.txt" : "_sf.txt"); }
 void deletePhotos(int idx) {
   if (!fsOk) return;
@@ -859,7 +883,7 @@ void handlePassword() {
 // ============================================================
 void handleAdminOverview() {
   if (requireAdmin() < 0) return;
-  String j; j.reserve(24000);
+  String j; j.reserve(40000);
   j = "{\"ok\":true,\"defaultPw\":" + String(jbool(defaultAdminPassword())) + ",\"users\":[";
   bool first = true;
   for (int i = 0; i < MAX_USERS; i++) if (users[i].flags & UF_USED) { if (!first) j += ","; first = false; j += userJson(i); }
