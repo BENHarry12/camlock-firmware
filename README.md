@@ -121,7 +121,7 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 
 ส่งทุก 10 วินาที และทันทีที่ประตู/กลอนเปลี่ยนสถานะ
 
-- **Telemetry:** `doorOpen`, `lockActive`, `alarm`, `returning`, `available`, `camCount`, `unlockCount`, `rssi`, `uptime`, `heap`
+- **Telemetry:** `activeCount`, `overdueCount`, `readyCount`, `pendingPay`, `pendingVerify`, `refundPending`, `members`, `event` (ทุกบรรทัดของบันทึก ส่งทันที), `doorOpen`, `lockActive`, `alarm`, `returning`, `available`, `camCount`, `unlockCount`, `rssi`, `uptime`, `heap`
 - **Client attributes:** `lockerId`, `firmware`, `ip`, `ssid`, `lockerName`, `lockerLoc`, `lockerNote`, `promptpay`, `approve`, `unlockMs`
 
 ## ขั้นตอนการเช่า (สถานะในบอร์ด)

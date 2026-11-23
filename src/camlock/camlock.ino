@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.5.0"
+#define FW_VERSION        "2.6.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -266,6 +266,10 @@ void copyStr(char *dst, size_t n, const String &src) {
   dst[ok] = 0;
 }
 
+#define EV_QUEUE 8
+uint8_t evQueue[EV_QUEUE], evHead = 0, evCount = 0;
+uint32_t evSeq = 0;
+
 void addLog(const String &msg) {
   LogEntry &e = logs[logHead];
   e.epoch = nowEpoch(); e.ms = millis();
@@ -273,6 +277,8 @@ void addLog(const String &msg) {
   logHead = (logHead + 1) % MAX_LOG;
   if (logCount < MAX_LOG) logCount++;
   Serial.printf("[LOG] %s\n", msg.c_str());
+  // คิวเหตุการณ์ไว้ส่งขึ้น ThingsBoard ทันที (แดชบอร์ดผู้ดูแลเห็นสด)
+  if (evCount < EV_QUEUE) { evQueue[(evHead + evCount) % EV_QUEUE] = logHead == 0 ? MAX_LOG - 1 : logHead - 1; evCount++; }
 }
 
 String randomHex(int bytes) {
@@ -1154,15 +1160,37 @@ const Route ROUTES[] = {
 };
 
 void publishTelemetry() {
-  int avail = 0, total = 0;
+  int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0;
+  uint32_t ep = nowEpoch();
   for (auto &c : cams) if (c.used) { total++; if (c.status == CAM_AVAILABLE) avail++; }
-  String j = "{\"doorOpen\":" + String(jbool(!doorClosed)) + ",\"lockActive\":" + jbool(relayActive) +
+  for (auto &r : rentals) {
+    if (r.status == RS_ACTIVE) { active++; if (ep && r.dueAt && ep > r.dueAt) overdue++; }
+    if (r.status == RS_READY) ready++;
+    if (r.status == RS_VERIFY || ((r.flags & RF_PAY_NOTIFIED) && r.paid < r.amount)) pendPay++;
+    if (r.status == RS_RETURNED && !(r.flags & RF_REFUNDED)) refund++;
+  }
+  for (auto &u : users) if (u.flags & UF_USED) { members++; if (u.verify == VF_PENDING) pendId++; }
+  String j = "{\"activeCount\":" + String(active) + ",\"overdueCount\":" + String(overdue) + ",\"readyCount\":" + String(ready) +
+             ",\"pendingPay\":" + String(pendPay) + ",\"pendingVerify\":" + String(pendId) + ",\"refundPending\":" + String(refund) +
+             ",\"members\":" + String(members) + ",\"doorOpen\":" + String(jbool(!doorClosed)) + ",\"lockActive\":" + jbool(relayActive) +
              ",\"alarm\":" + jbool(doorAlarm) + ",\"returning\":" + jbool(returningIdx >= 0) +
              ",\"available\":" + String(avail) + ",\"camCount\":" + String(total) +
              ",\"unlockCount\":" + String(totalUnlocks) + ",\"rssi\":" + String(WiFi.RSSI()) +
              ",\"uptime\":" + String(millis() / 1000) + ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
   mqtt.publish("v1/devices/me/telemetry", j.c_str());
   telemetryDirty = false;
+}
+
+// ส่งเหตุการณ์ในคิวขึ้น ThingsBoard เป็น telemetry "event" (แต่ละอันคนละเวลา ไม่ทับกัน)
+void publishEvents() {
+  while (evCount && mqtt.connected()) {
+    LogEntry &e = logs[evQueue[evHead]];
+    char ms[4]; snprintf(ms, sizeof(ms), "%03u", (unsigned)(evSeq++ % 1000));   // ms ต่างกันเพื่อไม่ให้ทับกัน
+    String j = e.epoch ? "{\"ts\":" + String(e.epoch) + ms + ",\"values\":{\"event\":" + jstr(e.msg) + "}}"
+                       : "{\"event\":" + jstr(e.msg) + "}";
+    mqtt.publish("v1/devices/me/telemetry", j.c_str());
+    evHead = (evHead + 1) % EV_QUEUE; evCount--;
+  }
 }
 
 void publishAttributes() {
@@ -1250,6 +1278,7 @@ void maintainNetwork() {
   mqtt.loop();
   if (attributesDirty) publishAttributes();
   if (telemetryDirty || now - lastTelemetry >= TELEMETRY_MS) { lastTelemetry = now; publishTelemetry(); }
+  publishEvents();
 }
 
 // ============================================================
