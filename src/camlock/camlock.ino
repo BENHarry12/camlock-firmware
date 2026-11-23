@@ -54,7 +54,7 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "3.0.0"
+#define FW_VERSION        "3.1.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 // บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
@@ -241,6 +241,7 @@ WalletTx wtx[MAX_WTX];
 uint8_t  wtxHead = 0, wtxCount = 0;
 // รุ่นของรูปกล้อง / รูปโปรไฟล์ (0 = ไม่มีรูป) ให้แอปรู้ว่าต้องโหลดรูปใหม่ไหม
 uint32_t camPh[MAX_CAMS], avPh[MAX_USERS];
+String   camUrl[MAX_CAMS];          // ลิงก์รูปกล้องที่ผู้ดูแลใส่ (เก็บ NVS คีย์ cu0..cu7)
 // ค่าปรับคืนช้า: นาทีละกี่บาท, ผ่อนผันกี่นาที, เกินกี่ชั่วโมงถือว่าไม่คืน (ยึดมัดจำ)
 uint16_t lateFeeMin = 100, lateGraceMin = 0, lostHours = 24;
 bool     requireApprove = true;
@@ -401,6 +402,7 @@ void loadAll() {
   if (prefs.getBytesLength("wtx") == sizeof(wtx)) { prefs.getBytes("wtx", wtx, sizeof(wtx)); wtxHead = prefs.getUChar("wtxH", 0) % MAX_WTX; uint8_t c = prefs.getUChar("wtxC", 0); wtxCount = c > MAX_WTX ? MAX_WTX : c; }
   if (prefs.getBytesLength("camPh") == sizeof(camPh)) prefs.getBytes("camPh", camPh, sizeof(camPh));
   if (prefs.getBytesLength("avPh") == sizeof(avPh)) prefs.getBytes("avPh", avPh, sizeof(avPh));
+  for (int i = 0; i < MAX_CAMS; i++) camUrl[i] = prefs.getString(("cu" + String(i)).c_str(), "");
   nextRentalId = prefs.getUShort("nextRid", 1);
   totalUnlocks = prefs.getUInt("unlocks", 0);
   // โหลดสมาชิก: รองรับจำนวนช่องเดิมที่น้อยกว่า และรูปแบบเก่า (UserV1) — ไม่ทำข้อมูลหาย
@@ -719,7 +721,7 @@ String userJson(int i) {
 String camJson(int i) {
   Camera &c = cams[i];
   return "{\"id\":" + String(i) + ",\"name\":" + jstr(c.name) + ",\"lens\":" + jstr(c.lens) + ",\"specs\":" + jstr(c.specs) +
-         ",\"price\":" + String(c.price) + ",\"deposit\":" + String(c.deposit) + ",\"status\":\"" + camStatusName(c.status) + "\",\"ph\":" + String(camPh[i]) + "}";
+         ",\"price\":" + String(c.price) + ",\"deposit\":" + String(c.deposit) + ",\"status\":\"" + camStatusName(c.status) + "\",\"ph\":" + String(camPh[i]) + ",\"url\":" + jstr(camUrl[i]) + "}";
 }
 String rentalJson(int i) {
   Rental &r = rentals[i];
@@ -1276,6 +1278,12 @@ void handleAdminCamSave() {
   copyStr(c.lens, sizeof(c.lens), arg("lens"));
   copyStr(c.specs, sizeof(c.specs), arg("specs"));
   c.price = price; c.deposit = dep;
+  if (hasArg("imgUrl")) {
+    String u = arg("imgUrl"); u.trim();
+    if (u.length() && (!(u.startsWith("https://") || u.startsWith("http://")) || u.length() > 400)) { sendErr(400, "ลิงก์รูปต้องขึ้นต้นด้วย https:// และยาวไม่เกิน 400 ตัวอักษร"); return; }
+    camUrl[id] = u;
+    prefs.begin("camlock", false); prefs.putString(("cu" + String(id)).c_str(), u); prefs.end();
+  }
   String st = arg("status");
   if (c.status != CAM_RENTED) c.status = (st == "maint") ? CAM_MAINT : CAM_AVAILABLE;
   if (isNew) c.status = (st == "maint") ? CAM_MAINT : CAM_AVAILABLE;
@@ -1292,6 +1300,7 @@ void handleAdminCamDelete() {
   addLog(String("ลบกล้อง: ") + cams[id].name);
   memset(&cams[id], 0, sizeof(Camera));
   if (fsOk) LittleFS.remove(camPhotoPath(id)); camPh[id] = 0; savePhotoVersions();
+  camUrl[id] = ""; prefs.begin("camlock", false); prefs.remove(("cu" + String(id)).c_str()); prefs.end();
   saveCams();
   sendOk("ลบแล้ว");
 }

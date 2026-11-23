@@ -113,7 +113,7 @@ ThingsBoard เป็นตัวกลางส่งคำสั่ง (RPC) �
 | `payWallet` | ผู้ใช้ | t, rid | จ่ายยอดค้างด้วยเงินในกระเป๋า |
 | `topupSlip` | ผู้ใช้ | t, payload | เติมเงินเข้ากระเป๋าด้วยสลิป |
 | `avatarUpload` / `avatar` | ผู้ใช้ | t, img / idx | รูปโปรไฟล์ |
-| `camPhoto` / `adminCamPhoto` | ทุกคน / ผู้ดูแล | id / id, img | รูปกล้อง |
+| `camPhoto` / `adminCamPhoto` | ทุกคน / ผู้ดูแล | id / id, img | รูปกล้อง (หรือใส่ลิงก์รูปด้วย `imgUrl` ใน `adminCamera`) |
 | `paySlip` | ผู้ใช้ | t, rid, payload | ส่ง QR payload จากสลิป ให้บอร์ดตรวจกับ EasySlip (ผลอยู่ใน `rental.slip` / `slipMsg`) |
 | `cancel` | ผู้ใช้ | t, rid | ยกเลิกก่อนรับกล้อง |
 | `open` | ผู้ใช้ | t, rid | ปลดล็อกเพื่อรับ (ถ้าชำระแล้ว) หรือคืนกล้อง |
