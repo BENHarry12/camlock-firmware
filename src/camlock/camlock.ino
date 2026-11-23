@@ -48,9 +48,13 @@
 // EasySlip (ตรวจสลิปโอนเงินอัตโนมัติ) — ใส่ API key ที่นี่ หรือใส่ในหน้า ตั้งค่า ของแอป (เก็บในบอร์ด ไม่โชว์ในเว็บ)
 // อย่า push key จริงขึ้น GitHub สาธารณะ
 #define EASYSLIP_KEY      ""
+
+// บัญชีพร้อมเพย์ที่รับเงิน (ค่าเริ่มต้น แก้ได้ในหน้า ตั้งค่า ของแอป)
+#define SHOP_PROMPTPAY    "0649682424"
+#define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.8.0"
+#define FW_VERSION        "2.8.1"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -218,7 +222,7 @@ uint32_t totalUnlocks = 0;
 bool     fsOk = false;          // LittleFS พร้อมใช้
 
 // การตั้งค่า
-String   lockerName, lockerLoc, lockerNote, promptpay, slipKey;
+String   lockerName, lockerLoc, lockerNote, promptpay, ppName, slipKey;
 // ผลตรวจสลิปล่าสุดของแต่ละรายการเช่า (0 = ไม่มี, 1 = กำลังตรวจ, 2 = ผ่าน, 3 = ไม่ผ่าน)
 uint8_t  slipState[MAX_RENTALS];
 String   slipMsg[MAX_RENTALS];
@@ -338,7 +342,7 @@ void saveSettings() {
   prefs.putString("lname", lockerName); prefs.putString("lloc", lockerLoc); prefs.putString("lnote", lockerNote);
   prefs.putString("pp", promptpay);    prefs.putBool("approve", requireApprove);
   prefs.putUShort("holdMs", unlockMs); prefs.putUShort("alarmSec", alarmSec);
-  prefs.putString("slipKey", slipKey);
+  prefs.putString("slipKey", slipKey); prefs.putString("ppName", ppName);
   prefs.end();
 }
 
@@ -355,6 +359,9 @@ void loadAll() {
   lockerLoc  = prefs.getString("lloc", "อาคาร 11 ชั้น 1");
   lockerNote = prefs.getString("lnote", "หน้าห้องแล็บ · เปิด 24 ชม.");
   promptpay  = prefs.getString("pp", "");
+  if (!promptpay.length()) promptpay = SHOP_PROMPTPAY;
+  ppName     = prefs.getString("ppName", "");
+  if (!ppName.length()) ppName = SHOP_PP_NAME;
   slipKey    = prefs.getString("slipKey", "");
   requireApprove = prefs.getBool("approve", true);
   unlockMs   = prefs.getUShort("holdMs", DEFAULT_HOLD_MS);
@@ -679,7 +686,7 @@ void handleStatus() {
   j += ",\"uptime\":" + String(millis() / 1000);
   j += ",\"heap\":" + String(ESP.getFreeHeap());
   j += ",\"unlocks\":" + String(totalUnlocks);
-  j += ",\"promptpay\":" + jstr(promptpay);
+  j += ",\"promptpay\":" + jstr(promptpay) + ",\"ppName\":" + jstr(ppName);
   j += ",\"easyslip\":" + String(jbool(easySlipKey().length() > 0));
   j += ",\"approve\":" + String(jbool(requireApprove));
   j += ",\"unlockMs\":" + String(unlockMs);
@@ -874,6 +881,13 @@ bool receiverMatches(const String &acc) {
   if (promptpay.length() == 10 && promptpay[0] == '0') return maskedMatch(acc, "66" + promptpay.substring(1));
   return false;
 }
+// สำรอง: บางธนาคารไม่ส่งเลขพร้อมเพย์ของผู้รับ ใช้ชื่อแทน (ชื่อจริงคำแรกต้องตรง)
+bool nameMatches(const String &rname) {
+  if (!ppName.length() || !rname.length()) return false;
+  String first = ppName; int sp = first.indexOf(' '); if (sp > 0) first = first.substring(0, sp);
+  if (first.length() < 3) return false;
+  return rname.indexOf(first) >= 0;
+}
 bool slipRefUsed(const String &ref) {
   if (!fsOk || !LittleFS.exists("/slips.txt")) return false;
   File f = LittleFS.open("/slips.txt", "r");
@@ -943,7 +957,8 @@ void processSlipJob() {
   if (!ref.length()) { slipFail(i, "สลิปไม่มีเลขอ้างอิง"); return; }
   if (slipRefUsed(ref)) { slipFail(i, "สลิปนี้ถูกใช้ไปแล้ว"); telemetryDirty = true; return; }
   uint32_t owed = r.amount > r.paid ? r.amount - r.paid : 0;
-  bool recvOk = receiverMatches(proxy) || (bankAc.length() && receiverMatches(bankAc));
+  bool recvOk = receiverMatches(proxy) || (bankAc.length() && receiverMatches(bankAc)) ||
+                (!proxy.length() && nameMatches(rname));
   if (!recvOk) {
     // ผู้รับไม่ตรงพร้อมเพย์ของร้าน ส่งให้ผู้ดูแลตรวจเอง
     r.flags |= RF_PAY_NOTIFIED; if (r.status == RS_AWAIT) r.status = RS_VERIFY; saveRentals();
@@ -1222,7 +1237,7 @@ void handleAdminEvidence() {
 void handleAdminSettings() {
   if (requireAdmin() < 0) return;
   sendJson(200, "{\"ok\":true,\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
-                ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
+                ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) + ",\"ppName\":" + jstr(ppName) +
                 ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
                 ",\"alarmSec\":" + String(alarmSec) + ",\"ssid\":" + jstr(WIFI_SSID) +
                 ",\"slipKeySet\":" + jbool(easySlipKey().length() > 0) + ",\"slipKeyFromCode\":" + jbool(!slipKey.length() && strlen(EASYSLIP_KEY) > 0) + "}");
@@ -1246,6 +1261,7 @@ void handleAdminSettingsSave() {
     if (d.length() && d.length() != 10 && d.length() != 13 && d.length() != 15) { sendErr(400, "พร้อมเพย์ต้องเป็นเบอร์ 10 หลัก หรือเลขบัตร 13 หลัก"); return; }
     promptpay = d;
   }
+  if (hasArg("ppName")) { ppName = arg("ppName"); ppName.trim(); }
   if (hasArg("lockerName")) { String s = arg("lockerName"); s.trim(); if (s.length()) lockerName = s; }
   if (hasArg("lockerLoc"))  { lockerLoc = arg("lockerLoc"); lockerLoc.trim(); }
   if (hasArg("lockerNote")) { lockerNote = arg("lockerNote"); lockerNote.trim(); }
@@ -1356,7 +1372,7 @@ void publishEvents() {
 void publishAttributes() {
   String j = "{\"lockerId\":\"" LOCKER_ID "\",\"firmware\":\"" FW_VERSION "\",\"ip\":" + jstr(WiFi.localIP().toString()) +
              ",\"ssid\":" + jstr(WIFI_SSID) + ",\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
-             ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
+             ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) + ",\"ppName\":" + jstr(ppName) +
              ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
              ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(unlockMs / 1000) +
              ",\"easyslip\":" + jbool(easySlipKey().length() > 0) + "}";
