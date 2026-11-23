@@ -28,6 +28,8 @@
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
 #include <time.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <sys/time.h>
 
 /* ---------- ตั้งค่าตรงนี้ ---------- */
@@ -42,9 +44,13 @@
 // และถือว่าปิดเมื่อกลอนล็อกกลับ (ผู้ใช้กด "ล็อกตู้" ในแอป หรือครบเวลาเปิดค้าง)
 // ติด reed switch ที่ J4 แล้วค่อยเปลี่ยนเป็น 1
 #define HAS_REED_SWITCH   0
+
+// EasySlip (ตรวจสลิปโอนเงินอัตโนมัติ) — ใส่ API key ที่นี่ หรือใส่ในหน้า ตั้งค่า ของแอป (เก็บในบอร์ด ไม่โชว์ในเว็บ)
+// อย่า push key จริงขึ้น GitHub สาธารณะ
+#define EASYSLIP_KEY      ""
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.7.2"
+#define FW_VERSION        "2.8.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -212,7 +218,12 @@ uint32_t totalUnlocks = 0;
 bool     fsOk = false;          // LittleFS พร้อมใช้
 
 // การตั้งค่า
-String   lockerName, lockerLoc, lockerNote, promptpay;
+String   lockerName, lockerLoc, lockerNote, promptpay, slipKey;
+// ผลตรวจสลิปล่าสุดของแต่ละรายการเช่า (0 = ไม่มี, 1 = กำลังตรวจ, 2 = ผ่าน, 3 = ไม่ผ่าน)
+uint8_t  slipState[MAX_RENTALS];
+String   slipMsg[MAX_RENTALS];
+int      slipJob = -1;            // รายการที่รอตรวจ (ทำใน loop ไม่บล็อก RPC)
+String   slipPayload;
 bool     requireApprove = true;
 uint16_t unlockMs = DEFAULT_HOLD_MS, alarmSec = 90;
 
@@ -327,6 +338,7 @@ void saveSettings() {
   prefs.putString("lname", lockerName); prefs.putString("lloc", lockerLoc); prefs.putString("lnote", lockerNote);
   prefs.putString("pp", promptpay);    prefs.putBool("approve", requireApprove);
   prefs.putUShort("holdMs", unlockMs); prefs.putUShort("alarmSec", alarmSec);
+  prefs.putString("slipKey", slipKey);
   prefs.end();
 }
 
@@ -343,6 +355,7 @@ void loadAll() {
   lockerLoc  = prefs.getString("lloc", "อาคาร 11 ชั้น 1");
   lockerNote = prefs.getString("lnote", "หน้าห้องแล็บ · เปิด 24 ชม.");
   promptpay  = prefs.getString("pp", "");
+  slipKey    = prefs.getString("slipKey", "");
   requireApprove = prefs.getBool("approve", true);
   unlockMs   = prefs.getUShort("holdMs", DEFAULT_HOLD_MS);
   alarmSec   = prefs.getUShort("alarmSec", 90);
@@ -628,7 +641,8 @@ String rentalJson(int i) {
          ",\"due\":" + String(r.dueAt) + ",\"returned\":" + String(r.returnedAt) + ",\"amount\":" + String(r.amount) +
          ",\"paid\":" + String(r.paid) + ",\"lateFee\":" + String(r.lateFee) + ",\"refunded\":" + jbool(r.flags & RF_REFUNDED) +
          ",\"notified\":" + jbool(r.flags & RF_PAY_NOTIFIED) +
-         ",\"photoPick\":" + jbool(r.flags & RF_PHOTO_PICK) + ",\"photoRet\":" + jbool(r.flags & RF_PHOTO_RET) + ",\"returning\":" + jbool(returningIdx == i) + "}";
+         ",\"photoPick\":" + jbool(r.flags & RF_PHOTO_PICK) + ",\"photoRet\":" + jbool(r.flags & RF_PHOTO_RET) + ",\"returning\":" + jbool(returningIdx == i) +
+         ",\"slip\":" + String(slipState[i]) + ",\"slipMsg\":" + jstr(slipMsg[i]) + "}";
 }
 
 int findRental(uint32_t id) {
@@ -666,6 +680,7 @@ void handleStatus() {
   j += ",\"heap\":" + String(ESP.getFreeHeap());
   j += ",\"unlocks\":" + String(totalUnlocks);
   j += ",\"promptpay\":" + jstr(promptpay);
+  j += ",\"easyslip\":" + String(jbool(easySlipKey().length() > 0));
   j += ",\"approve\":" + String(jbool(requireApprove));
   j += ",\"unlockMs\":" + String(unlockMs);
   j += ",\"returning\":" + String(jbool(returningIdx >= 0));
@@ -819,6 +834,133 @@ void handlePayNotify() {
   }
   saveRentals();
   sendJson(200, "{\"ok\":true,\"rental\":" + rentalJson(i) + "}");
+}
+
+// ---------- ตรวจสลิปด้วย EasySlip ----------
+String easySlipKey() { return slipKey.length() ? slipKey : String(EASYSLIP_KEY); }
+
+// paySlip: แอปอ่าน QR บนสลิปแล้วส่ง payload มา บอร์ดเอาไปถาม EasySlip (ทำใน loop แล้วตอบผลผ่าน rental.slip)
+void handlePaySlip() {
+  int u = requireUser(); if (u < 0) return;
+  int i = ownRental(u); if (i < 0) return;
+  Rental &r = rentals[i];
+  if (!easySlipKey().length()) { sendErr(503, "ยังไม่ได้ตั้งค่า EasySlip ใช้ปุ่ม \"ฉันชำระแล้ว\" แทน"); return; }
+  if (r.paid >= r.amount) { sendOk("ชำระครบแล้ว"); return; }
+  if (r.status != RS_AWAIT && r.status != RS_VERIFY) { sendErr(409, "รายการนี้ไม่ต้องชำระแล้ว"); return; }
+  String pl = arg("payload"); pl.trim();
+  if (pl.length() < 10 || pl.length() > 255) { sendErr(400, "อ่าน QR บนสลิปไม่ได้ ลองถ่ายให้ชัดขึ้น"); return; }
+  if (slipJob >= 0 && slipJob != i) { sendErr(429, "กำลังตรวจสลิปของคนอื่นอยู่ ลองใหม่ในไม่กี่วินาที"); return; }
+  slipJob = i; slipPayload = pl;
+  slipState[i] = 1; slipMsg[i] = "กำลังตรวจสลิป…";
+  sendJson(200, "{\"ok\":true,\"pending\":true,\"rental\":" + rentalJson(i) + "}");
+}
+
+// เลขที่มองเห็นในบัญชีที่ปิดบัง (เช่น 08xxxxxx89) ต้องตรงกับพร้อมเพย์ของร้าน นับจากท้าย
+bool maskedMatch(const String &masked, const String &full) {
+  String m, f;
+  for (unsigned k = 0; k < masked.length(); k++) { char c = masked[k]; if (isDigit(c) || c == 'x' || c == 'X' || c == '*') m += c; }
+  for (unsigned k = 0; k < full.length(); k++) if (isDigit(full[k])) f += full[k];
+  if (!m.length() || !f.length()) return false;
+  int digits = 0;
+  for (int a = m.length() - 1, b = f.length() - 1; a >= 0 && b >= 0; a--, b--) {
+    if (isDigit(m[a])) { if (m[a] != f[b]) return false; digits++; }
+  }
+  return digits >= 2;
+}
+// เบอร์ 0812345678 ในสลิปบางธนาคารขึ้นเป็น 66812345678
+bool receiverMatches(const String &acc) {
+  if (!promptpay.length()) return false;         // ยังไม่ตั้งพร้อมเพย์ของร้าน เทียบผู้รับไม่ได้ ให้ผู้ดูแลตรวจ
+  if (maskedMatch(acc, promptpay)) return true;
+  if (promptpay.length() == 10 && promptpay[0] == '0') return maskedMatch(acc, "66" + promptpay.substring(1));
+  return false;
+}
+bool slipRefUsed(const String &ref) {
+  if (!fsOk || !LittleFS.exists("/slips.txt")) return false;
+  File f = LittleFS.open("/slips.txt", "r");
+  while (f.available()) { String l = f.readStringUntil('\n'); l.trim(); if (l == ref) { f.close(); return true; } }
+  f.close(); return false;
+}
+void slipRefSave(const String &ref) {
+  if (!fsOk) return;
+  if (LittleFS.exists("/slips.txt")) { File c = LittleFS.open("/slips.txt", "r"); size_t n = c.size(); c.close(); if (n > 16000) LittleFS.remove("/slips.txt"); }
+  File f = LittleFS.open("/slips.txt", "a"); if (f) { f.println(ref); f.close(); }
+}
+String urlEncode(const String &s) {
+  String o; const char *hex = "0123456789ABCDEF";
+  for (unsigned k = 0; k < s.length(); k++) {
+    char c = s[k];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') o += c;
+    else { o += '%'; o += hex[(c >> 4) & 15]; o += hex[c & 15]; }
+  }
+  return o;
+}
+void slipFail(int i, const String &msg) {
+  slipState[i] = 3; slipMsg[i] = msg;
+  addLog("สลิป #" + String(rentals[i].id) + " ไม่ผ่าน: " + msg);
+}
+
+void processSlipJob() {
+  if (slipJob < 0) return;
+  int i = slipJob; slipJob = -1;
+  Rental &r = rentals[i];
+  if (WiFi.status() != WL_CONNECTED) { slipFail(i, "ตู้ไม่มีอินเทอร์เน็ต ลองใหม่อีกครั้ง"); telemetryDirty = true; return; }
+  esp_task_wdt_reset();
+  WiFiClientSecure tls; tls.setInsecure();   // ไม่ตรวจใบรับรอง (บอร์ดไม่มีที่เก็บ CA) ข้อมูลยังเข้ารหัสอยู่
+  HTTPClient http; http.setTimeout(8000); http.setConnectTimeout(6000);
+  String url = "https://developer.easyslip.com/api/v1/verify?payload=" + urlEncode(slipPayload);
+  if (!http.begin(tls, url)) { slipFail(i, "เชื่อม EasySlip ไม่ได้"); return; }
+  http.addHeader("Authorization", "Bearer " + easySlipKey());
+  int code = http.GET();
+  esp_task_wdt_reset();
+  String body = code > 0 ? http.getString() : "";
+  http.end();
+  esp_task_wdt_reset();
+  if (code <= 0) { slipFail(i, "เชื่อม EasySlip ไม่ได้ (" + String(code) + ")"); telemetryDirty = true; return; }
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument d;
+#else
+  DynamicJsonDocument d(4096);
+#endif
+  if (deserializeJson(d, body)) { slipFail(i, "คำตอบจาก EasySlip ไม่ถูกต้อง (HTTP " + String(code) + ")"); telemetryDirty = true; return; }
+  if (code != 200 || (d["status"] | 0) != 200) {
+    String m = d["message"] | "error";
+    String th = m == "slip_not_found" ? "ไม่พบสลิปนี้ในระบบธนาคาร (สลิปปลอมหรือเพิ่งโอน ลองใหม่ใน 1 นาที)" :
+                m == "invalid_payload" ? "QR บนสลิปไม่ถูกต้อง" :
+                m == "duplicate_slip" ? "สลิปนี้ถูกใช้ไปแล้ว" :
+                m == "quota_exceeded" ? "โควตา EasySlip หมด แจ้งผู้ดูแล" :
+                m == "unauthorized" ? "API key ของ EasySlip ไม่ถูกต้อง แจ้งผู้ดูแล" :
+                m == "application_expired" || m == "application_deactivated" ? "บัญชี EasySlip หมดอายุ แจ้งผู้ดูแล" :
+                "EasySlip ตอบว่า " + m;
+    slipFail(i, th); telemetryDirty = true; return;
+  }
+  JsonVariant dt = d["data"];
+  String ref = dt["transRef"] | "";
+  uint32_t amt = (uint32_t)((dt["amount"]["amount"] | 0.0) + 0.001);
+  String rname = dt["receiver"]["account"]["name"]["th"] | (dt["receiver"]["account"]["name"]["en"] | "");
+  String proxy = dt["receiver"]["account"]["proxy"]["account"] | "";
+  String bankAc = dt["receiver"]["account"]["bank"]["account"] | "";
+  if (!ref.length()) { slipFail(i, "สลิปไม่มีเลขอ้างอิง"); return; }
+  if (slipRefUsed(ref)) { slipFail(i, "สลิปนี้ถูกใช้ไปแล้ว"); telemetryDirty = true; return; }
+  uint32_t owed = r.amount > r.paid ? r.amount - r.paid : 0;
+  bool recvOk = receiverMatches(proxy) || (bankAc.length() && receiverMatches(bankAc));
+  if (!recvOk) {
+    // ผู้รับไม่ตรงพร้อมเพย์ของร้าน ส่งให้ผู้ดูแลตรวจเอง
+    r.flags |= RF_PAY_NOTIFIED; if (r.status == RS_AWAIT) r.status = RS_VERIFY; saveRentals();
+    slipFail(i, "ชื่อ/บัญชีผู้รับในสลิปไม่ตรงกับร้าน (" + rname + ") ส่งให้ผู้ดูแลตรวจแล้ว");
+    telemetryDirty = true; return;
+  }
+  if (amt < owed) {
+    slipFail(i, "ยอดในสลิป " + String(amt) + " บาท น้อยกว่ายอดที่ต้องชำระ " + String(owed) + " บาท");
+    telemetryDirty = true; return;
+  }
+  slipRefSave(ref);
+  r.paid = r.amount; r.flags &= ~RF_PAY_NOTIFIED;
+  if (r.status == RS_AWAIT || r.status == RS_VERIFY) r.status = RS_READY;
+  saveRentals();
+  slipState[i] = 2; slipMsg[i] = "ตรวจสลิปผ่าน ยอด " + String(amt) + " บาท";
+  addLog("ชำระด้วยสลิป #" + String(r.id) + " " + String(amt) + " บาท (EasySlip ref " + ref + ")");
+  telemetryDirty = true;
 }
 
 void handleCancel() {
@@ -1082,7 +1224,8 @@ void handleAdminSettings() {
   sendJson(200, "{\"ok\":true,\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
                 ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
                 ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
-                ",\"alarmSec\":" + String(alarmSec) + ",\"ssid\":" + jstr(WIFI_SSID) + "}");
+                ",\"alarmSec\":" + String(alarmSec) + ",\"ssid\":" + jstr(WIFI_SSID) +
+                ",\"slipKeySet\":" + jbool(easySlipKey().length() > 0) + ",\"slipKeyFromCode\":" + jbool(!slipKey.length() && strlen(EASYSLIP_KEY) > 0) + "}");
 }
 
 void handleAdminSettingsSave() {
@@ -1107,6 +1250,7 @@ void handleAdminSettingsSave() {
   if (hasArg("lockerLoc"))  { lockerLoc = arg("lockerLoc"); lockerLoc.trim(); }
   if (hasArg("lockerNote")) { lockerNote = arg("lockerNote"); lockerNote.trim(); }
   if (hasArg("approve")) requireApprove = arg("approve") == "1";
+  if (hasArg("slipKey")) { String k = arg("slipKey"); k.trim(); if (k == "-") slipKey = ""; else if (k.length()) slipKey = k; }
   saveSettings();
   attributesDirty = true;
   addLog("ผู้ดูแลบันทึกการตั้งค่า");
@@ -1152,7 +1296,7 @@ const Route ROUTES[] = {
   {"evidence", handleEvidence},       {"adminEvidence", handleAdminEvidence},
   {"verifyUpload", handleVerifyUpload}, {"verifySubmit", handleVerifySubmit}, {"adminUserPhoto", handleAdminUserPhoto},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
-  {"pay", handlePayNotify},           {"cancel", handleCancel},           {"open", handleOpen},
+  {"pay", handlePayNotify},           {"paySlip", handlePaySlip},           {"cancel", handleCancel},           {"open", handleOpen},
   {"extend", handleExtend},           {"password", handlePassword},
   {"adminOverview", handleAdminOverview}, {"adminUnlock", handleAdminUnlock}, {"adminRental", handleAdminRental},
   {"adminCamera", handleAdminCamSave},    {"adminCameraDelete", handleAdminCamDelete}, {"adminUser", handleAdminUser},
@@ -1214,7 +1358,8 @@ void publishAttributes() {
              ",\"ssid\":" + jstr(WIFI_SSID) + ",\"lockerName\":" + jstr(lockerName) + ",\"lockerLoc\":" + jstr(lockerLoc) +
              ",\"lockerNote\":" + jstr(lockerNote) + ",\"promptpay\":" + jstr(promptpay) +
              ",\"approve\":" + jbool(requireApprove) + ",\"unlockMs\":" + String(unlockMs) +
-             ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(unlockMs / 1000) + "}";
+             ",\"reedSwitch\":" + jbool(HAS_REED_SWITCH) + ",\"autoCloseSec\":" + String(unlockMs / 1000) +
+             ",\"easyslip\":" + jbool(easySlipKey().length() > 0) + "}";
   mqtt.publish("v1/devices/me/attributes", j.c_str());
   attributesDirty = false;
 }
@@ -1414,6 +1559,7 @@ void loop() {
   updateRelay();
   updateDoor();
   updateStatusLed();
+  processSlipJob();
   if (millis() - lastHousekeep > 10000) { lastHousekeep = millis(); housekeeping(); }
   delay(2);
 }
