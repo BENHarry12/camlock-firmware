@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.7.0"
+#define FW_VERSION        "2.7.1"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -72,7 +72,7 @@
 #define RETURN_WAIT_MS    90000UL
 #define LATE_GRACE_SEC    (10 * 60)
 #define WDT_TIMEOUT_S     15
-#define TELEMETRY_MS      10000UL
+#define TELEMETRY_MS      20000UL   // heartbeat (ค่าเปลี่ยนจะส่งทันที)
 #define MQTT_BUFFER       49152     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
 
 // ---------- โครงสร้างข้อมูล (ต้องอยู่ก่อนฟังก์ชันแรก เพราะ Arduino IDE สร้าง prototype ไว้ตรงนั้น) ----------
@@ -1159,6 +1159,7 @@ const Route ROUTES[] = {
   {"adminSettings", handleAdminSettings}, {"adminSettingsSave", handleAdminSettingsSave}, {"adminLog", handleAdminLog},
 };
 
+uint32_t lastHeartbeat = 0;
 void publishTelemetry() {
   int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0;
   uint32_t ep = nowEpoch();
@@ -1175,22 +1176,37 @@ void publishTelemetry() {
              ",\"members\":" + String(members) + ",\"doorOpen\":" + String(jbool(!doorClosed)) + ",\"lockActive\":" + jbool(relayActive) +
              ",\"alarm\":" + jbool(doorAlarm) + ",\"returning\":" + jbool(returningIdx >= 0) +
              ",\"available\":" + String(avail) + ",\"camCount\":" + String(total) +
-             ",\"unlockCount\":" + String(totalUnlocks) + ",\"rssi\":" + String(WiFi.RSSI()) +
-             ",\"uptime\":" + String(millis() / 1000) + ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
+             ",\"unlockCount\":" + String(totalUnlocks);
+  // ส่งเฉพาะเมื่อค่าเปลี่ยน หรือครบรอบ heartbeat (ลดจำนวนข้อความ ไม่ให้ ThingsBoard ตัดเพราะส่งถี่เกิน)
+  static String lastState;
+  bool heartbeat = millis() - lastHeartbeat >= TELEMETRY_MS;
+  if (j == lastState && !heartbeat) { telemetryDirty = false; return; }
+  lastState = j;
+  if (heartbeat) lastHeartbeat = millis();
+  j += ",\"rssi\":" + String(WiFi.RSSI()) + ",\"uptime\":" + String(millis() / 1000) + ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
   mqtt.publish("v1/devices/me/telemetry", j.c_str());
   telemetryDirty = false;
 }
 
 // ส่งเหตุการณ์ในคิวขึ้น ThingsBoard เป็น telemetry "event" (แต่ละอันคนละเวลา ไม่ทับกัน)
 void publishEvents() {
-  while (evCount && mqtt.connected()) {
+  static uint32_t lastEv = 0;
+  if (!evCount || !mqtt.connected() || millis() - lastEv < 1000) return;   // รวมส่งเป็นชุด อย่างมากวินาทีละครั้ง
+  lastEv = millis();
+  String j = "[";
+  bool first = true;
+  while (evCount) {
     LogEntry &e = logs[evQueue[evHead]];
     char ms[4]; snprintf(ms, sizeof(ms), "%03u", (unsigned)(evSeq++ % 1000));   // ms ต่างกันเพื่อไม่ให้ทับกัน
-    String j = e.epoch ? "{\"ts\":" + String(e.epoch) + ms + ",\"values\":{\"event\":" + jstr(e.msg) + "}}"
-                       : "{\"event\":" + jstr(e.msg) + "}";
-    mqtt.publish("v1/devices/me/telemetry", j.c_str());
+    if (e.epoch) {
+      if (!first) j += ",";
+      first = false;
+      j += "{\"ts\":" + String(e.epoch) + ms + ",\"values\":{\"event\":" + jstr(e.msg) + "}}";
+    }
     evHead = (evHead + 1) % EV_QUEUE; evCount--;
   }
+  j += "]";
+  if (!first) mqtt.publish("v1/devices/me/telemetry", j.c_str());
 }
 
 void publishAttributes() {
@@ -1340,7 +1356,7 @@ void maintainNetwork() {
   }
   mqtt.loop();
   if (attributesDirty) publishAttributes();
-  if (telemetryDirty || now - lastTelemetry >= TELEMETRY_MS) { lastTelemetry = now; publishTelemetry(); }
+  if ((telemetryDirty && now - lastTelemetry >= 300) || now - lastTelemetry >= TELEMETRY_MS) { lastTelemetry = now; publishTelemetry(); }
   publishEvents();
 }
 
