@@ -54,7 +54,7 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "3.4.0"
+#define FW_VERSION        "3.4.1"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 // บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
@@ -2017,8 +2017,16 @@ void onMqttMessage(char *topic, byte *payload, unsigned int len) {
   }
   if (RESP.length() == 0) sendErr(500, "ไม่มีคำตอบ");
   String out = "v1/devices/me/rpc/response/" + requestId;
-  if (!mqtt.publish(out.c_str(), (const uint8_t *)RESP.c_str(), RESP.length()))
-    Serial.printf("[RPC] ส่งคำตอบไม่สำเร็จ (%u ไบต์) เพิ่ม MQTT_BUFFER\n", RESP.length());
+  // คำตอบใหญ่เกินบัฟเฟอร์ MQTT: ส่งข้อความผิดพลาดสั้น ๆ แทน (เว็บจะได้ไม่ค้างรอจนหมดเวลา)
+  if (RESP.length() + out.length() + 16 > MQTT_BUFFER) {
+    Serial.printf("[RPC] คำตอบ %s ใหญ่เกิน (%u ไบต์)\n", method ? method : "-", RESP.length());
+    sendErr(507, "ข้อมูลใหญ่เกินกว่าจะส่งได้ ลบรายการเก่าในหน้าการเช่าบางส่วน");
+  }
+  if (!mqtt.publish(out.c_str(), (const uint8_t *)RESP.c_str(), RESP.length())) {
+    Serial.printf("[RPC] ส่งคำตอบไม่สำเร็จ (%u ไบต์)\n", RESP.length());
+    sendErr(500, "ส่งคำตอบไม่สำเร็จ ลองใหม่");
+    mqtt.publish(out.c_str(), (const uint8_t *)RESP.c_str(), RESP.length());
+  }
   telemetryDirty = true;   // สถานะอาจเปลี่ยน ส่งค่าใหม่ทันที
   RESP = "";
 }
