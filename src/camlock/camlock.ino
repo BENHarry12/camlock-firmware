@@ -54,7 +54,7 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "3.2.0"
+#define FW_VERSION        "3.3.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 // บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
@@ -141,6 +141,9 @@ struct Rental {
 };
 struct Session { char token[33]; int8_t user; uint32_t lastMs; };
 struct LogEntry { uint32_t epoch, ms; char msg[LOG_LEN]; };
+// คำขอถอนเงินจากกระเป๋า (เช่น มัดจำที่คืนแล้ว) ผู้ดูแลโอนพร้อมเพย์ให้เองแล้วกด "โอนแล้ว"
+enum WdState : uint8_t { WD_NONE = 0, WD_PENDING = 1, WD_PAID = 2, WD_REJECTED = 3 };
+struct Withdraw { uint32_t at; uint32_t doneAt; uint32_t amount; uint8_t st; char pp[18]; char name[40]; char note[40]; };
 struct WalletTx { uint32_t epoch; int32_t amount; uint8_t user; char note[27]; };   // รายการเข้า/ออกของกระเป๋าเงิน
 
 WiFiClient   net;
@@ -235,6 +238,7 @@ uint8_t  slipJobKind = 0;         // 0 = ชำระรายการเช่
 String   slipPayload;
 // กระเป๋าเงิน (บาท) ของสมาชิกแต่ละคน เก็บใน NVS แยกจากข้อมูลสมาชิก
 uint32_t wallet[MAX_USERS];
+Withdraw wd[MAX_USERS];
 uint8_t  topState[MAX_USERS];     // ผลเติมเงินด้วยสลิปล่าสุด (0/1/2/3 เหมือน slipState)
 String   topMsg[MAX_USERS];
 WalletTx wtx[MAX_WTX];
@@ -368,6 +372,9 @@ void saveWallet() {
   prefs.putBytes("wtx", wtx, sizeof(wtx)); prefs.putUChar("wtxH", wtxHead); prefs.putUChar("wtxC", wtxCount);
   prefs.end();
 }
+void saveWithdrawals() {
+  prefs.begin("camlock", false); prefs.putBytes("wd", wd, sizeof(wd)); prefs.end();
+}
 void savePhotoVersions() {
   prefs.begin("camlock", false);
   prefs.putBytes("camPh", camPh, sizeof(camPh)); prefs.putBytes("avPh", avPh, sizeof(avPh));
@@ -400,6 +407,8 @@ void loadAll() {
   memset(wallet, 0, sizeof(wallet)); memset(wtx, 0, sizeof(wtx)); memset(camPh, 0, sizeof(camPh)); memset(avPh, 0, sizeof(avPh));
   if (prefs.getBytesLength("wallet") == sizeof(wallet)) prefs.getBytes("wallet", wallet, sizeof(wallet));
   if (prefs.getBytesLength("wtx") == sizeof(wtx)) { prefs.getBytes("wtx", wtx, sizeof(wtx)); wtxHead = prefs.getUChar("wtxH", 0) % MAX_WTX; uint8_t c = prefs.getUChar("wtxC", 0); wtxCount = c > MAX_WTX ? MAX_WTX : c; }
+  memset(wd, 0, sizeof(wd));
+  if (prefs.getBytesLength("wd") == sizeof(wd)) prefs.getBytes("wd", wd, sizeof(wd));
   if (prefs.getBytesLength("camPh") == sizeof(camPh)) prefs.getBytes("camPh", camPh, sizeof(camPh));
   if (prefs.getBytesLength("avPh") == sizeof(avPh)) prefs.getBytes("avPh", avPh, sizeof(avPh));
   for (int i = 0; i < MAX_CAMS; i++) camUrl[i] = prefs.getString(("cu" + String(i)).c_str(), "");
@@ -866,7 +875,7 @@ void handleMe() {
   j += "],\"cams\":[";
   first = true;
   for (int i = 0; i < MAX_CAMS; i++) if (cams[i].used) { if (!first) j += ","; first = false; j += camJson(i); }
-  j += "],\"wallet\":" + String(wallet[u]) + ",\"topup\":{\"st\":" + String(topState[u]) + ",\"msg\":" + jstr(topMsg[u]) + "},\"wtx\":[";
+  j += "],\"withdraw\":" + withdrawJson(u) + ",\"wallet\":" + String(wallet[u]) + ",\"topup\":{\"st\":" + String(topState[u]) + ",\"msg\":" + jstr(topMsg[u]) + "},\"wtx\":[";
   first = true;
   for (int k = 0; k < wtxCount; k++) {
     WalletTx &t = wtx[(wtxHead - 1 - k + MAX_WTX) % MAX_WTX];
@@ -973,6 +982,83 @@ void handleTopupSlip() {
 }
 
 // payWallet: จ่ายยอดค้างของรายการด้วยเงินในกระเป๋า
+String withdrawJson(int u) {
+  Withdraw &w = wd[u];
+  return "{\"st\":" + String(w.st) + ",\"amount\":" + String(w.amount) + ",\"at\":" + String(w.at) + ",\"doneAt\":" + String(w.doneAt) +
+         ",\"pp\":" + jstr(w.pp) + ",\"name\":" + jstr(w.name) + ",\"note\":" + jstr(w.note) + "}";
+}
+String digitsOnly(const String &x) { String o; for (unsigned k = 0; k < x.length(); k++) if (x[k] >= '0' && x[k] <= '9') o += x[k]; return o; }
+
+// ผู้ใช้: ขอถอนเงินจากกระเป๋าเข้าพร้อมเพย์ของตัวเอง (หักจากกระเป๋าทันทีเพื่อกันซ้ำ)
+void handleWithdraw() {
+  int u = requireUser(); if (u < 0) return;
+  if (wd[u].st == WD_PENDING) { sendErr(409, "มีคำขอถอนเงินรออยู่แล้ว " + String(wd[u].amount) + " บาท"); return; }
+  if (openRentalOf(u) >= 0) {
+    // ห้ามถอนเงินที่ต้องใช้จ่ายรายการค้าง
+    int r = openRentalOf(u);
+    if (rentals[r].status == RS_ACTIVE) { sendErr(409, "คืนกล้องให้เรียบร้อยก่อนถอนเงิน (กันค่าปรับคืนช้า)"); return; }
+  }
+  long amt = arg("amount").toInt();
+  String pp = digitsOnly(arg("pp"));
+  String nm = arg("name"); nm.trim();
+  if (amt < 1) { sendErr(400, "ใส่จำนวนเงินที่จะถอน"); return; }
+  if ((uint32_t)amt > wallet[u]) { sendErr(402, "เงินในกระเป๋ามีแค่ " + String(wallet[u]) + " บาท"); return; }
+  if (pp.length() != 10 && pp.length() != 13) { sendErr(400, "พร้อมเพย์ต้องเป็นเบอร์ 10 หลัก หรือเลขบัตร 13 หลัก"); return; }
+  if (nm.length() < 2) { sendErr(400, "ใส่ชื่อบัญชีผู้รับเงิน"); return; }
+  Withdraw &w = wd[u]; memset(&w, 0, sizeof(w));
+  w.at = nowEpoch(); w.amount = amt; w.st = WD_PENDING;
+  copyStr(w.pp, sizeof(w.pp), pp.c_str()); copyStr(w.name, sizeof(w.name), nm.c_str());
+  walletAdd(u, -amt, "ขอถอนเงิน (รอโอน)");
+  saveWithdrawals();
+  addLog(String("💸 คำขอถอนเงิน ") + users[u].sid + " " + String(amt) + " บาท -> " + pp);
+  telemetryDirty = true;
+  sendJson(200, "{\"ok\":true,\"msg\":" + jstr("ส่งคำขอถอน " + String(amt) + " บาทแล้ว ผู้ดูแลจะโอนเข้าพร้อมเพย์ให้") +
+                ",\"wallet\":" + String(wallet[u]) + ",\"withdraw\":" + withdrawJson(u) + "}");
+}
+// ผู้ใช้: ยกเลิกคำขอที่ยังไม่ได้โอน เงินกลับเข้ากระเป๋า
+void handleWithdrawCancel() {
+  int u = requireUser(); if (u < 0) return;
+  Withdraw &w = wd[u];
+  if (w.st != WD_PENDING) { sendErr(409, "ไม่มีคำขอที่รอโอน"); return; }
+  walletAdd(u, w.amount, "ยกเลิกถอนเงิน");
+  w.st = WD_NONE; w.amount = 0; saveWithdrawals(); telemetryDirty = true;
+  sendJson(200, "{\"ok\":true,\"msg\":\"ยกเลิกแล้ว เงินกลับเข้ากระเป๋า\",\"wallet\":" + String(wallet[u]) + ",\"withdraw\":" + withdrawJson(u) + "}");
+}
+// ผู้ดูแล: รายการคำขอถอนเงิน (รอโอนก่อน)
+void handleAdminWithdrawals() {
+  if (requireAdmin() < 0) return;
+  String j = "{\"ok\":true,\"items\":["; bool first = true;
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < MAX_USERS; i++) {
+      if (!(users[i].flags & UF_USED) || wd[i].st == WD_NONE) continue;
+      if ((pass == 0) != (wd[i].st == WD_PENDING)) continue;
+      if (!first) j += ","; first = false;
+      j += "{\"u\":" + String(i) + ",\"sid\":" + jstr(users[i].sid) + ",\"uname\":" + jstr(users[i].name) + ",\"wallet\":" + String(wallet[i]) +
+           ",\"w\":" + withdrawJson(i) + "}";
+    }
+  sendJson(200, j + "]}");
+}
+// ผู้ดูแล: action=paid (โอนแล้ว) หรือ reject (ปฏิเสธ คืนเงินเข้ากระเป๋า)
+void handleAdminWithdraw() {
+  if (requireAdmin() < 0) return;
+  long u = arg("u").toInt();
+  if (u < 0 || u >= MAX_USERS || !(users[u].flags & UF_USED)) { sendErr(404, "ไม่พบสมาชิก"); return; }
+  Withdraw &w = wd[u];
+  if (w.st != WD_PENDING) { sendErr(409, "คำขอนี้ปิดไปแล้ว"); return; }
+  String act = arg("action"), note = arg("note");
+  copyStr(w.note, sizeof(w.note), note.c_str()); w.doneAt = nowEpoch();
+  if (act == "paid") {
+    w.st = WD_PAID;
+    addLog(String("💸 โอนเงินถอนแล้ว ") + users[u].sid + " " + String(w.amount) + " บาท");
+  } else if (act == "reject") {
+    w.st = WD_REJECTED;
+    walletAdd(u, w.amount, "ถอนเงินไม่สำเร็จ คืนเข้ากระเป๋า");
+    addLog(String("ปฏิเสธถอนเงิน ") + users[u].sid + " " + String(w.amount) + " บาท");
+  } else { sendErr(400, "action ต้องเป็น paid หรือ reject"); return; }
+  saveWithdrawals(); telemetryDirty = true;
+  sendOk(act == "paid" ? "บันทึกว่าโอนแล้ว" : "ปฏิเสธแล้ว คืนเงินเข้ากระเป๋าผู้ใช้");
+}
+
 void handlePayWallet() {
   int u = requireUser(); if (u < 0) return;
   int i = ownRental(u); if (i < 0) return;
@@ -1450,7 +1536,7 @@ void handleAdminUser() {
   } else if (act == "delete") {
     if (openRentalOf(idx) >= 0) { sendErr(409, "สมาชิกมีรายการเช่าค้างอยู่"); return; }
     dropSessionsOf(idx); deletePhotos(idx); addLog(String("ลบสมาชิก: ") + u.sid);
-    wallet[idx] = 0; saveWallet();
+    wallet[idx] = 0; saveWallet(); memset(&wd[idx], 0, sizeof(Withdraw)); saveWithdrawals();
     if (fsOk) LittleFS.remove(avatarPath(idx)); avPh[idx] = 0; savePhotoVersions();
     memset(&u, 0, sizeof(User)); saveUsers(); sendOk("ลบแล้ว"); return;
   } else { sendErr(400, "คำสั่งไม่ถูกต้อง"); return; }
@@ -1659,7 +1745,7 @@ const Route ROUTES[] = {
   {"verifyUpload", handleVerifyUpload}, {"verifySubmit", handleVerifySubmit}, {"adminUserPhoto", handleAdminUserPhoto},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
   {"pay", handlePayNotify},           {"paySlip", handlePaySlip},
-  {"payWallet", handlePayWallet},     {"topupSlip", handleTopupSlip},     {"camPhoto", handleCamPhoto},
+  {"payWallet", handlePayWallet}, {"withdraw", handleWithdraw}, {"withdrawCancel", handleWithdrawCancel}, {"adminWithdrawals", handleAdminWithdrawals}, {"adminWithdraw", handleAdminWithdraw},     {"topupSlip", handleTopupSlip},     {"camPhoto", handleCamPhoto},
   {"adminCamPhoto", handleAdminCamPhoto}, {"avatarUpload", handleAvatarUpload}, {"avatar", handleAvatar},           {"cancel", handleCancel},           {"open", handleOpen},
   {"extend", handleExtend},           {"password", handlePassword},
   {"adminOverview", handleAdminOverview}, {"adminUnlock", handleAdminUnlock}, {"adminRental", handleAdminRental},
@@ -1669,7 +1755,7 @@ const Route ROUTES[] = {
 
 uint32_t lastHeartbeat = 0;
 void publishTelemetry() {
-  int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0;
+  int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0, pendWd = 0;
   uint32_t ep = nowEpoch();
   for (auto &c : cams) if (c.used) { total++; if (c.status == CAM_AVAILABLE) avail++; }
   for (auto &r : rentals) {
@@ -1679,8 +1765,9 @@ void publishTelemetry() {
     if (r.status == RS_RETURNED && !(r.flags & RF_REFUNDED) && r.deposit) refund++;
   }
   for (auto &u : users) if (u.flags & UF_USED) { members++; if (u.verify == VF_PENDING) pendId++; }
+  for (int i = 0; i < MAX_USERS; i++) if ((users[i].flags & UF_USED) && wd[i].st == WD_PENDING) pendWd++;
   String j = "{\"activeCount\":" + String(active) + ",\"overdueCount\":" + String(overdue) + ",\"readyCount\":" + String(ready) +
-             ",\"pendingPay\":" + String(pendPay) + ",\"pendingVerify\":" + String(pendId) + ",\"refundPending\":" + String(refund) +
+             ",\"pendingPay\":" + String(pendPay) + ",\"pendingVerify\":" + String(pendId) + ",\"refundPending\":" + String(refund) + ",\"withdrawPending\":" + String(pendWd) +
              ",\"members\":" + String(members) + ",\"doorOpen\":" + String(jbool(!doorClosed)) + ",\"lockActive\":" + jbool(relayActive) +
              ",\"alarm\":" + jbool(doorAlarm) + ",\"returning\":" + jbool(returningIdx >= 0) +
              ",\"available\":" + String(avail) + ",\"camCount\":" + String(total) +
