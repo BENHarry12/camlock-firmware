@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.7.1"
+#define FW_VERSION        "2.7.2"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -491,10 +491,10 @@ void updateDoor() {
 void updateStatusLed() {
   uint32_t t = millis(); bool on;
   if (relayActive) on = true;
-  else if (doorAlarm) on = (t / 120) % 2;                       // กะพริบเร็ว = ประตูเปิดค้าง
+  else if (WiFi.status() != WL_CONNECTED) on = (t / 50) % 2;    // กะพริบรัวมาก (10 ครั้ง/วินาที) = ยังไม่ต่อ WiFi
+  else if (doorAlarm) { uint32_t p = t % 1000; on = p < 100 || (p >= 200 && p < 300); }   // กะพริบ 2 ทีแล้วเว้น = ประตูเปิดค้าง
   else if (mqtt.connected()) on = true;                          // ติดค้าง = ออนไลน์กับ ThingsBoard
-  else if (WiFi.status() == WL_CONNECTED) on = (t / 700) % 2;    // กะพริบช้า = มี WiFi แต่ยังต่อ ThingsBoard ไม่ได้
-  else on = (t / 1500) % 10 == 0;                                // แวบ ๆ = ไม่มี WiFi
+  else on = (t / 700) % 2;                                       // กะพริบช้า = มี WiFi แต่ยังต่อ ThingsBoard ไม่ได้
   digitalWrite(PIN_STATUS_LED, on ? HIGH : LOW);
 }
 
