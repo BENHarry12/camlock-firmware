@@ -54,7 +54,7 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "3.3.0"
+#define FW_VERSION        "3.4.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 // บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
@@ -92,7 +92,7 @@
 enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4, UF_TEST = 8 };
 enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
 enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
-enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2, RF_PHOTO_PICK = 4, RF_PHOTO_RET = 8, RF_FORFEIT = 16, RF_LOST = 32 };
+enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2, RF_PHOTO_PICK = 4, RF_PHOTO_RET = 8, RF_FORFEIT = 16, RF_LOST = 32, RF_REFUND_WAIT = 64 };
 
 enum Verify      : uint8_t { VF_NONE = 0, VF_REJECTED = 1, VF_PENDING = 2, VF_OK = 3 };
 
@@ -141,9 +141,25 @@ struct Rental {
 };
 struct Session { char token[33]; int8_t user; uint32_t lastMs; };
 struct LogEntry { uint32_t epoch, ms; char msg[LOG_LEN]; };
-// คำขอถอนเงินจากกระเป๋า (เช่น มัดจำที่คืนแล้ว) ผู้ดูแลโอนพร้อมเพย์ให้เองแล้วกด "โอนแล้ว"
+// บัญชีธนาคารของผู้ใช้ สำหรับรับเงินมัดจำคืน / ถอนเงินจากกระเป๋า (code = รหัสธนาคาร เช่น KBANK, PP = พร้อมเพย์)
+struct BankAcct { char code[8]; char acct[20]; char holder[40]; };
+// รหัสธนาคาร, ชื่อ, จำนวนหลักเลขบัญชีที่ยอมรับ (min-max)
+struct BankDef { const char *code; const char *name; uint8_t minLen, maxLen; };
+const BankDef BANKS[] = {
+  {"KBANK", "กสิกรไทย", 10, 10}, {"SCB", "ไทยพาณิชย์", 10, 10}, {"BBL", "กรุงเทพ", 10, 10},
+  {"KTB", "กรุงไทย", 10, 10}, {"BAY", "กรุงศรีอยุธยา", 10, 10}, {"TTB", "ทหารไทยธนชาต (ttb)", 10, 10},
+  {"GSB", "ออมสิน", 12, 12}, {"BAAC", "ธ.ก.ส.", 12, 12}, {"GHB", "อาคารสงเคราะห์", 12, 12},
+  {"UOB", "ยูโอบี", 10, 10}, {"CIMB", "ซีไอเอ็มบี ไทย", 10, 10}, {"KKP", "เกียรตินาคินภัทร", 10, 10},
+  {"LHB", "แลนด์ แอนด์ เฮ้าส์", 10, 10}, {"TISCO", "ทิสโก้", 10, 10}, {"ICBC", "ไอซีบีซี (ไทย)", 10, 10},
+  {"PP", "พร้อมเพย์", 10, 13}, {"OTHER", "ธนาคารอื่น", 8, 15},
+};
+// คำขอถอนเงินจากกระเป๋า (เงินที่เติมไว้) ผู้ดูแลโอนเข้าบัญชีแล้วกด "โอนแล้ว"
 enum WdState : uint8_t { WD_NONE = 0, WD_PENDING = 1, WD_PAID = 2, WD_REJECTED = 3 };
-struct Withdraw { uint32_t at; uint32_t doneAt; uint32_t amount; uint8_t st; char pp[18]; char name[40]; char note[40]; };
+struct Withdraw { uint32_t at; uint32_t doneAt; uint32_t amount; uint8_t st; BankAcct to; char note[40]; };
+// การคืนเงินเข้าบัญชีธนาคาร ผูกกับช่องรายการเช่าเดียวกัน (index เดียวกับ rentals[])
+//   kind 0 = คืนมัดจำหลังตรวจสภาพ, 1 = คืนเงินรายการที่ยกเลิก
+enum RfState : uint8_t { RQ_NONE = 0, RQ_WAIT = 1, RQ_PAID = 2 };
+struct RefundRec { uint16_t rid; uint8_t st; uint8_t kind; uint32_t amount, at, doneAt; BankAcct to; char ref[32]; };
 struct WalletTx { uint32_t epoch; int32_t amount; uint8_t user; char note[27]; };   // รายการเข้า/ออกของกระเป๋าเงิน
 
 WiFiClient   net;
@@ -239,6 +255,8 @@ String   slipPayload;
 // กระเป๋าเงิน (บาท) ของสมาชิกแต่ละคน เก็บใน NVS แยกจากข้อมูลสมาชิก
 uint32_t wallet[MAX_USERS];
 Withdraw wd[MAX_USERS];
+BankAcct bank[MAX_USERS];
+RefundRec rq[MAX_RENTALS];
 uint8_t  topState[MAX_USERS];     // ผลเติมเงินด้วยสลิปล่าสุด (0/1/2/3 เหมือน slipState)
 String   topMsg[MAX_USERS];
 WalletTx wtx[MAX_WTX];
@@ -372,9 +390,31 @@ void saveWallet() {
   prefs.putBytes("wtx", wtx, sizeof(wtx)); prefs.putUChar("wtxH", wtxHead); prefs.putUChar("wtxC", wtxCount);
   prefs.end();
 }
-void saveWithdrawals() {
-  prefs.begin("camlock", false); prefs.putBytes("wd", wd, sizeof(wd)); prefs.end();
+// เขียนไฟล์แบบปลอดภัย: เขียน .tmp ให้ครบก่อน แล้วค่อยแทนไฟล์จริง (ไฟดับกลางทางข้อมูลเดิมไม่เสีย)
+bool saveFileBlob(const char *path, const void *data, size_t n) {
+  if (!fsOk) return false;
+  String tmp = String(path) + ".tmp";
+  File f = LittleFS.open(tmp, "w");
+  if (!f) return false;
+  size_t w = f.write((const uint8_t *)data, n); f.close();
+  if (w != n) { LittleFS.remove(tmp); return false; }
+  LittleFS.remove(path);
+  return LittleFS.rename(tmp, path);
 }
+// โหลดไฟล์ ถ้าขนาดไม่ตรงถือว่าไม่มี (คืน false) ถ้าไฟล์จริงหายแต่มี .tmp ที่ครบ ใช้ .tmp
+bool loadFileBlob(const char *path, void *data, size_t n) {
+  if (!fsOk) return false;
+  String use = path;
+  if (!LittleFS.exists(use)) { use = String(path) + ".tmp"; if (!LittleFS.exists(use)) return false; }
+  File f = LittleFS.open(use, "r");
+  if (!f) return false;
+  bool ok = f.size() == n && f.read((uint8_t *)data, n) == n;
+  f.close();
+  return ok;
+}
+void saveWithdrawals() { if (!saveFileBlob("/wd.bin", wd, sizeof(wd))) addLog("⚠ บันทึกคำขอถอนเงินไม่สำเร็จ"); }
+void saveBanks()       { if (!saveFileBlob("/bank.bin", bank, sizeof(bank))) addLog("⚠ บันทึกบัญชีธนาคารไม่สำเร็จ"); }
+void saveRefunds()     { if (!saveFileBlob("/refund.bin", rq, sizeof(rq))) addLog("⚠ บันทึกรายการคืนเงินไม่สำเร็จ"); }
 void savePhotoVersions() {
   prefs.begin("camlock", false);
   prefs.putBytes("camPh", camPh, sizeof(camPh)); prefs.putBytes("avPh", avPh, sizeof(avPh));
@@ -407,8 +447,11 @@ void loadAll() {
   memset(wallet, 0, sizeof(wallet)); memset(wtx, 0, sizeof(wtx)); memset(camPh, 0, sizeof(camPh)); memset(avPh, 0, sizeof(avPh));
   if (prefs.getBytesLength("wallet") == sizeof(wallet)) prefs.getBytes("wallet", wallet, sizeof(wallet));
   if (prefs.getBytesLength("wtx") == sizeof(wtx)) { prefs.getBytes("wtx", wtx, sizeof(wtx)); wtxHead = prefs.getUChar("wtxH", 0) % MAX_WTX; uint8_t c = prefs.getUChar("wtxC", 0); wtxCount = c > MAX_WTX ? MAX_WTX : c; }
-  memset(wd, 0, sizeof(wd));
-  if (prefs.getBytesLength("wd") == sizeof(wd)) prefs.getBytes("wd", wd, sizeof(wd));
+  memset(wd, 0, sizeof(wd)); memset(bank, 0, sizeof(bank)); memset(rq, 0, sizeof(rq));
+  if (!loadFileBlob("/wd.bin", wd, sizeof(wd))) memset(wd, 0, sizeof(wd));
+  if (!loadFileBlob("/bank.bin", bank, sizeof(bank))) memset(bank, 0, sizeof(bank));
+  if (!loadFileBlob("/refund.bin", rq, sizeof(rq))) memset(rq, 0, sizeof(rq));
+  for (auto &b : bank) { b.code[sizeof(b.code) - 1] = 0; b.acct[sizeof(b.acct) - 1] = 0; b.holder[sizeof(b.holder) - 1] = 0; }
   if (prefs.getBytesLength("camPh") == sizeof(camPh)) prefs.getBytes("camPh", camPh, sizeof(camPh));
   if (prefs.getBytesLength("avPh") == sizeof(avPh)) prefs.getBytes("avPh", avPh, sizeof(avPh));
   for (int i = 0; i < MAX_CAMS; i++) camUrl[i] = prefs.getString(("cu" + String(i)).c_str(), "");
@@ -521,6 +564,39 @@ uint32_t refundableOf(const Rental &r) {
   if (v > (long)r.deposit) v = r.deposit;
   return v;
 }
+// เงินที่ต้องโอนคืนผู้เช่า: คืนกล้องแล้ว = มัดจำที่เหลือหลังหักค่าปรับ, ยกเลิก = เงินที่จ่ายมาแล้วทั้งหมด
+uint32_t refundDue(const Rental &r) {
+  if (r.flags & (RF_REFUNDED | RF_FORFEIT | RF_LOST)) return 0;
+  if (r.status == RS_CANCELLED) return r.paid;
+  if (r.status == RS_RETURNED) return refundableOf(r);
+  return 0;
+}
+// รายการ i มีบันทึกคืนเงินของตัวเองจริงไหม (กันข้อมูลค้างจากรายการเก่าที่ใช้ช่องเดียวกัน)
+bool rqValid(int i) { return i >= 0 && i < MAX_RENTALS && rq[i].st != RQ_NONE && rq[i].rid == rentals[i].id; }
+void rqClear(int i) { if (i >= 0 && i < MAX_RENTALS) memset(&rq[i], 0, sizeof(RefundRec)); }
+// เปิดคำขอโอนเงินคืน (รอผู้ดูแลโอนเข้าบัญชีธนาคาร)
+void openRefund(int i, uint8_t kind) {
+  Rental &r = rentals[i];
+  uint32_t amt = refundDue(r);
+  if (!amt) { r.flags |= RF_REFUNDED; r.flags &= ~RF_REFUND_WAIT; rqClear(i); return; }
+  rqClear(i);
+  rq[i].rid = r.id; rq[i].st = RQ_WAIT; rq[i].kind = kind; rq[i].amount = amt; rq[i].at = nowEpoch();
+  r.flags |= RF_REFUND_WAIT;
+  saveRefunds();
+  addLog("💸 รอโอนคืน #" + String(r.id) + " " + String(amt) + " บาท" + (bank[r.user < MAX_USERS ? r.user : 0].acct[0] ? "" : " (ผู้ใช้ยังไม่กรอกบัญชี)"));
+}
+bool bankSet(int u) { return u >= 0 && u < MAX_USERS && bank[u].code[0] && bank[u].acct[0] && bank[u].holder[0]; }
+String bankJson(const BankAcct &b) {
+  return "{\"code\":" + jstr(b.code) + ",\"acct\":" + jstr(b.acct) + ",\"holder\":" + jstr(b.holder) + "}";
+}
+// รายการช่องนี้จบสมบูรณ์ (ทับได้เมื่อระบบเต็ม): ไม่มีเงินค้างโอนคืน และไม่มียอดค้างชำระ
+bool rentalClosed(const Rental &r) {
+  if (r.flags & RF_REFUND_WAIT) return false;
+  if (r.status == RS_CANCELLED) return r.paid == 0 || (r.flags & RF_REFUNDED);
+  if (r.status == RS_RETURNED) return ((r.flags & RF_REFUNDED) || refundableOf(r) == 0) && debtOf(r) == 0;
+  return false;
+}
+
 void applyLateFee(Rental &r, uint32_t ep) {
   uint32_t fee = lateFeeAt(r, ep);
   if (fee) { r.lateFee = fee; r.amount += fee; }
@@ -746,7 +822,17 @@ String rentalJson(int i) {
          ",\"photoPick\":" + jbool(r.flags & RF_PHOTO_PICK) + ",\"photoRet\":" + jbool(r.flags & RF_PHOTO_RET) + ",\"returning\":" + jbool(returningIdx == i) +
          ",\"slip\":" + String(slipState[i]) + ",\"slipMsg\":" + jstr(slipMsg[i]) +
          ",\"forfeit\":" + jbool(r.flags & RF_FORFEIT) + ",\"lost\":" + jbool(r.flags & RF_LOST) +
-         ",\"lateNow\":" + String(r.status == RS_ACTIVE ? lateFeeAt(r, nowEpoch()) : 0) + ",\"refundable\":" + String(refundableOf(r)) + "}";
+         ",\"lateNow\":" + String(r.status == RS_ACTIVE ? lateFeeAt(r, nowEpoch()) : 0) + ",\"refundable\":" + String(refundableOf(r)) + ",\"rf\":" + refundJson(i) + "}";
+}
+// สถานะการโอนเงินคืนของรายการ: st 0 = ไม่มี, 1 = รอผู้ดูแลโอน, 2 = โอนแล้ว
+//   to = บัญชีที่จะโอน (ตอนรอ = บัญชีปัจจุบันของผู้ใช้, โอนแล้ว = บัญชีที่โอนจริง)
+String refundJson(int i) {
+  Rental &r = rentals[i];
+  if (!rqValid(i)) return "{\"st\":0}";
+  RefundRec &q = rq[i];
+  const BankAcct &to = q.st == RQ_PAID ? q.to : bank[r.user < MAX_USERS ? r.user : 0];
+  return "{\"st\":" + String(q.st) + ",\"kind\":" + String(q.kind) + ",\"amount\":" + String(q.amount) + ",\"at\":" + String(q.at) +
+         ",\"doneAt\":" + String(q.doneAt) + ",\"ref\":" + jstr(q.ref) + ",\"to\":" + bankJson(to) + "}";
 }
 
 int findRental(uint32_t id) {
@@ -875,7 +961,7 @@ void handleMe() {
   j += "],\"cams\":[";
   first = true;
   for (int i = 0; i < MAX_CAMS; i++) if (cams[i].used) { if (!first) j += ","; first = false; j += camJson(i); }
-  j += "],\"withdraw\":" + withdrawJson(u) + ",\"wallet\":" + String(wallet[u]) + ",\"topup\":{\"st\":" + String(topState[u]) + ",\"msg\":" + jstr(topMsg[u]) + "},\"wtx\":[";
+  j += "],\"bank\":" + bankJson(bank[u]) + ",\"withdraw\":" + withdrawJson(u) + ",\"wallet\":" + String(wallet[u]) + ",\"topup\":{\"st\":" + String(topState[u]) + ",\"msg\":" + jstr(topMsg[u]) + "},\"wtx\":[";
   first = true;
   for (int k = 0; k < wtxCount; k++) {
     WalletTx &t = wtx[(wtxHead - 1 - k + MAX_WTX) % MAX_WTX];
@@ -905,8 +991,7 @@ void handleRent() {
   if (slot < 0) {   // เต็ม: ทับรายการที่จบแล้วอันเก่าที่สุด
     for (int i = 0; i < MAX_RENTALS; i++) {
       Rental &r = rentals[i];
-      if ((r.status == RS_CANCELLED || (r.status == RS_RETURNED && (r.flags & RF_REFUNDED || r.paid >= r.amount))) &&
-          (slot < 0 || r.id < rentals[slot].id)) slot = i;
+      if (rentalClosed(r) && (slot < 0 || r.id < rentals[slot].id)) slot = i;
     }
   }
   if (slot < 0) { sendErr(409, "ระบบเต็ม กรุณาติดต่อผู้ดูแล"); return; }
@@ -914,6 +999,7 @@ void handleRent() {
   Camera &c = cams[cam];
   Rental &r = rentals[slot];
   deleteEvidence(r.id);          // ทับรายการเก่า: ลบรูปหลักฐานของรายการนั้นด้วย
+  if (rq[slot].st != RQ_NONE) { rqClear(slot); saveRefunds(); }
   memset(&r, 0, sizeof(Rental));
   r.id = nextRentalId++; r.user = u; r.cam = cam; r.hours = hours;
   r.price = isTest ? 0 : c.price; r.deposit = isTest ? 0 : c.deposit;   // บัญชีทดสอบ: ยอด 0 ไม่ปนรายได้ ค่าปรับก็เป็น 0
@@ -985,11 +1071,58 @@ void handleTopupSlip() {
 String withdrawJson(int u) {
   Withdraw &w = wd[u];
   return "{\"st\":" + String(w.st) + ",\"amount\":" + String(w.amount) + ",\"at\":" + String(w.at) + ",\"doneAt\":" + String(w.doneAt) +
-         ",\"pp\":" + jstr(w.pp) + ",\"name\":" + jstr(w.name) + ",\"note\":" + jstr(w.note) + "}";
+         ",\"to\":" + bankJson(w.to) + ",\"note\":" + jstr(w.note) + "}";
 }
 String digitsOnly(const String &x) { String o; for (unsigned k = 0; k < x.length(); k++) if (x[k] >= '0' && x[k] <= '9') o += x[k]; return o; }
 
-// ผู้ใช้: ขอถอนเงินจากกระเป๋าเข้าพร้อมเพย์ของตัวเอง (หักจากกระเป๋าทันทีเพื่อกันซ้ำ)
+// ===================== บัญชีธนาคารสำหรับรับเงินคืน =====================
+const BankDef *findBank(const String &code) { for (auto &b : BANKS) if (code == b.code) return &b; return nullptr; }
+
+// ผู้ใช้: บันทึก/แก้ไขบัญชีธนาคาร (ว่างทั้งหมด = ลบ)
+void handleBankSave() {
+  int u = requireUser(); if (u < 0) return;
+  String code = arg("code"); code.trim(); code.toUpperCase();
+  String acct = digitsOnly(arg("acct"));
+  String holder = arg("holder"); holder.trim();
+  if (!code.length() && !acct.length() && !holder.length()) {
+    for (auto &x : rentals) if (x.status != RS_EMPTY && x.user == u && (x.flags & RF_REFUND_WAIT)) { sendErr(409, "ลบไม่ได้ มีเงินรอโอนคืนเข้าบัญชีนี้"); return; }
+    if (wd[u].st == WD_PENDING) { sendErr(409, "ลบไม่ได้ มีคำขอถอนเงินรออยู่"); return; }
+    memset(&bank[u], 0, sizeof(BankAcct)); saveBanks(); sendOk("ลบบัญชีแล้ว"); return;
+  }
+  const BankDef *b = findBank(code);
+  if (!b) { sendErr(400, "เลือกธนาคาร"); return; }
+  if (code == "PP") {
+    if (acct.length() != 10 && acct.length() != 13) { sendErr(400, "พร้อมเพย์ต้องเป็นเบอร์โทร 10 หลัก หรือเลขบัตรประชาชน 13 หลัก"); return; }
+    if (acct.length() == 10 && acct[0] != '0') { sendErr(400, "เบอร์โทรพร้อมเพย์ต้องขึ้นต้นด้วย 0"); return; }
+  } else if (acct.length() < b->minLen || acct.length() > b->maxLen) {
+    sendErr(400, String("เลขบัญชี") + b->name + " ต้องมี " + (b->minLen == b->maxLen ? String(b->minLen) : String(b->minLen) + "-" + String(b->maxLen)) + " หลัก (ตอนนี้ " + String(acct.length()) + " หลัก)");
+    return;
+  }
+  if (holder.length() < 4) { sendErr(400, "ใส่ชื่อ-นามสกุลเจ้าของบัญชีให้ครบ"); return; }
+  if (holder.length() >= sizeof(bank[u].holder)) { sendErr(400, "ชื่อบัญชียาวเกินไป"); return; }
+  BankAcct &k = bank[u];
+  copyStr(k.code, sizeof(k.code), code); copyStr(k.acct, sizeof(k.acct), acct); copyStr(k.holder, sizeof(k.holder), holder);
+  saveBanks();
+  addLog(String("ผู้ใช้ ") + users[u].sid + " บันทึกบัญชีรับเงินคืน " + code);
+  telemetryDirty = true;
+  sendJson(200, "{\"ok\":true,\"msg\":\"บันทึกบัญชีแล้ว\",\"bank\":" + bankJson(k) + "}");
+}
+
+// ผู้ดูแล: รายการที่ต้องโอนเงินคืน (รอโอนก่อน แล้วตามด้วยที่โอนแล้วล่าสุด)
+void handleAdminRefunds() {
+  if (requireAdmin() < 0) return;
+  String j = "{\"ok\":true,\"items\":["; bool first = true;
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < MAX_RENTALS; i++) {
+      if (rentals[i].status == RS_EMPTY || !rqValid(i)) continue;
+      if ((pass == 0) != (rq[i].st == RQ_WAIT)) continue;
+      if (!first) j += ","; first = false;
+      j += rentalJson(i);
+    }
+  sendJson(200, j + "]}");
+}
+
+// ผู้ใช้: ขอถอนเงินจากกระเป๋าเข้าบัญชีของตัวเอง (หักจากกระเป๋าทันทีเพื่อกันซ้ำ)
 void handleWithdraw() {
   int u = requireUser(); if (u < 0) return;
   if (wd[u].st == WD_PENDING) { sendErr(409, "มีคำขอถอนเงินรออยู่แล้ว " + String(wd[u].amount) + " บาท"); return; }
@@ -999,20 +1132,18 @@ void handleWithdraw() {
     if (rentals[r].status == RS_ACTIVE) { sendErr(409, "คืนกล้องให้เรียบร้อยก่อนถอนเงิน (กันค่าปรับคืนช้า)"); return; }
   }
   long amt = arg("amount").toInt();
-  String pp = digitsOnly(arg("pp"));
-  String nm = arg("name"); nm.trim();
+
   if (amt < 1) { sendErr(400, "ใส่จำนวนเงินที่จะถอน"); return; }
   if ((uint32_t)amt > wallet[u]) { sendErr(402, "เงินในกระเป๋ามีแค่ " + String(wallet[u]) + " บาท"); return; }
-  if (pp.length() != 10 && pp.length() != 13) { sendErr(400, "พร้อมเพย์ต้องเป็นเบอร์ 10 หลัก หรือเลขบัตร 13 หลัก"); return; }
-  if (nm.length() < 2) { sendErr(400, "ใส่ชื่อบัญชีผู้รับเงิน"); return; }
+  if (!bankSet(u)) { sendErr(409, "กรอกบัญชีธนาคารที่จะรับเงินก่อน (หน้าบัญชี → บัญชีรับเงินคืน)"); return; }
   Withdraw &w = wd[u]; memset(&w, 0, sizeof(w));
   w.at = nowEpoch(); w.amount = amt; w.st = WD_PENDING;
-  copyStr(w.pp, sizeof(w.pp), pp.c_str()); copyStr(w.name, sizeof(w.name), nm.c_str());
+  w.to = bank[u];
   walletAdd(u, -amt, "ขอถอนเงิน (รอโอน)");
   saveWithdrawals();
-  addLog(String("💸 คำขอถอนเงิน ") + users[u].sid + " " + String(amt) + " บาท -> " + pp);
+  addLog(String("💸 คำขอถอนเงิน ") + users[u].sid + " " + String(amt) + " บาท -> " + w.to.code + " " + w.to.acct);
   telemetryDirty = true;
-  sendJson(200, "{\"ok\":true,\"msg\":" + jstr("ส่งคำขอถอน " + String(amt) + " บาทแล้ว ผู้ดูแลจะโอนเข้าพร้อมเพย์ให้") +
+  sendJson(200, "{\"ok\":true,\"msg\":" + jstr("ส่งคำขอถอน " + String(amt) + " บาทแล้ว ผู้ดูแลจะโอนเข้าบัญชีของคุณ") +
                 ",\"wallet\":" + String(wallet[u]) + ",\"withdraw\":" + withdrawJson(u) + "}");
 }
 // ผู้ใช้: ยกเลิกคำขอที่ยังไม่ได้โอน เงินกลับเข้ากระเป๋า
@@ -1312,6 +1443,15 @@ void processSlipJob() {
     slipFail(i, "ชื่อ/บัญชีผู้รับในสลิปไม่ตรงกับร้าน (" + rname + ") ส่งให้ผู้ดูแลตรวจแล้ว");
     telemetryDirty = true; return;
   }
+  if (r.status == RS_CANCELLED || r.status == RS_EMPTY || owed == 0) {
+    // สลิปมาถึงหลังรายการถูกยกเลิก/จ่ายครบแล้ว: ไม่ให้เงินหาย เก็บเข้ากระเป๋า (ถอนเข้าบัญชีได้)
+    if (amt < 1 || r.user >= MAX_USERS) { slipFail(i, "รายการนี้ไม่มียอดต้องชำระแล้ว"); telemetryDirty = true; return; }
+    slipRefSave(ref);
+    walletAdd(r.user, amt, "สลิปเกิน/หลังยกเลิก #" + String(r.id));
+    slipState[i] = 2; slipMsg[i] = "รายการนี้ไม่มียอดค้างแล้ว เงิน " + String(amt) + " บาทเข้ากระเป๋า (ถอนเข้าบัญชีได้)";
+    addLog("สลิปหลังปิดรายการ #" + String(r.id) + " " + String(amt) + " บาท → กระเป๋า");
+    telemetryDirty = true; return;
+  }
   if (amt < owed) {
     slipFail(i, "ยอดในสลิป " + String(amt) + " บาท น้อยกว่ายอดที่ต้องชำระ " + String(owed) + " บาท");
     telemetryDirty = true; return;
@@ -1331,11 +1471,15 @@ void handleCancel() {
   int i = ownRental(u); if (i < 0) return;
   Rental &r = rentals[i];
   if (r.status != RS_AWAIT && r.status != RS_VERIFY && r.status != RS_READY) { sendErr(409, "ยกเลิกไม่ได้แล้ว"); return; }
-  r.status = RS_CANCELLED;
+  r.status = RS_CANCELLED; r.flags &= ~RF_PAY_NOTIFIED;
   if (r.cam < MAX_CAMS && cams[r.cam].status == CAM_RENTED) { cams[r.cam].status = CAM_AVAILABLE; saveCams(); }
-  saveRentals();
-  addLog("ผู้ใช้ยกเลิก #" + String(r.id) + (r.paid ? " (ต้องคืนเงิน " + String(r.paid) + " บาท)" : ""));
-  sendOk(r.paid ? "ยกเลิกแล้ว ผู้ดูแลจะคืนเงินให้" : "ยกเลิกแล้ว");
+  uint32_t back = r.paid;
+  addLog("ผู้ใช้ยกเลิก #" + String(r.id) + (back ? " (ต้องโอนคืน " + String(back) + " บาท)" : ""));
+  if (back) openRefund(i, 1);
+  saveRentals(); telemetryDirty = true;
+  sendOk(back ? (bankSet(u) ? "ยกเลิกแล้ว ผู้ดูแลจะโอนเงิน " + String(back) + " บาทคืนเข้าบัญชีของคุณ"
+                            : "ยกเลิกแล้ว กรุณากรอกบัญชีธนาคารในหน้าบัญชี เพื่อรับเงิน " + String(back) + " บาทคืน")
+              : String("ยกเลิกแล้ว"));
 }
 
 // เปิดตู้: รับกล้อง (READY) หรือคืนกล้อง (ACTIVE)
@@ -1435,17 +1579,42 @@ void handleAdminRental() {
     if (returningIdx == i) returningIdx = -1;
     if (r.status == RS_ACTIVE) { r.status = RS_RETURNED; r.returnedAt = nowEpoch(); applyLateFee(r, r.returnedAt); freeCam = true; }
   } else if (act == "cancel") {
-    if (r.status == RS_AWAIT || r.status == RS_VERIFY || r.status == RS_READY) { r.status = RS_CANCELLED; freeCam = true; }
+    if (r.status == RS_AWAIT || r.status == RS_VERIFY || r.status == RS_READY) {
+      r.status = RS_CANCELLED; r.flags &= ~RF_PAY_NOTIFIED; freeCam = true;
+      if (r.paid) openRefund(i, 1);   // ลูกค้าจ่ายแล้ว: รอโอนคืนเข้าบัญชี
+    }
     else { sendErr(409, "ยกเลิกได้เฉพาะรายการที่ยังไม่รับกล้อง"); return; }
-  } else if (act == "refund") {       // ตรวจสภาพผ่าน: คืนมัดจำ (หักค่าปรับแล้ว) เข้ากระเป๋าผู้เช่า
+  } else if (act == "refund") {       // ตรวจสภาพผ่าน: อนุมัติคืนมัดจำ (หักค่าปรับแล้ว) → รอผู้ดูแลโอนเข้าบัญชีธนาคาร
     if (r.status != RS_RETURNED) { sendErr(409, "คืนมัดจำได้หลังคืนกล้องแล้ว"); return; }
     if (r.flags & RF_REFUNDED) { sendErr(409, "รายการนี้ปิดไปแล้ว"); return; }
-    uint32_t amt = refundableOf(r);
-    r.flags |= RF_REFUNDED;
-    if (amt) { r.amount -= amt; r.paid -= amt; walletAdd(r.user, amt, "คืนมัดจำ #" + String(r.id)); }
+    if (r.flags & RF_REFUND_WAIT) { sendErr(409, "อนุมัติแล้ว รอโอนเงินคืนอยู่"); return; }
+    uint32_t amt = refundDue(r);
+    openRefund(i, 0);
+    saveRentals(); telemetryDirty = true;
+    addLog("ผู้ดูแลตรวจสภาพผ่าน #" + String(r.id));
+    sendOk(amt ? "อนุมัติแล้ว โอนมัดจำ " + String(amt) + " บาทเข้าบัญชีผู้เช่า แล้วกด \"โอนค่ามัดจำคืนแล้ว\"" : String("ปิดรายการแล้ว (ไม่มีมัดจำต้องคืน)"));
+    return;
+  } else if (act == "refundPaid") {   // ผู้ดูแลโอนเงินคืนเข้าบัญชีธนาคารแล้ว
+    if (!(r.flags & RF_REFUND_WAIT) || !rqValid(i) || rq[i].st != RQ_WAIT) { sendErr(409, "รายการนี้ไม่มียอดรอโอนคืน"); return; }
+    String ref = arg("ref"); ref.trim();
+    bool hasBank = r.user < MAX_USERS && bankSet(r.user);
+    if (!hasBank && ref.length() < 2) { sendErr(409, "ผู้เช่ายังไม่กรอกบัญชีธนาคาร ถ้าคืนเงินช่องทางอื่นแล้ว ให้ใส่หมายเหตุว่าคืนอย่างไร"); return; }
+    RefundRec &q = rq[i];
+    uint32_t amt = q.amount;
+    if (amt > r.paid) amt = r.paid;                     // กันตัวเลขติดลบ
+    if (hasBank) q.to = bank[r.user]; else memset(&q.to, 0, sizeof(q.to));
+    copyStr(q.ref, sizeof(q.ref), ref);
+    q.amount = amt; q.st = RQ_PAID; q.doneAt = nowEpoch();
+    if (r.status == RS_RETURNED) r.amount = r.amount > amt ? r.amount - amt : 0;   // มัดจำไม่ใช่รายได้
+    r.paid -= amt;
+    r.flags = (r.flags & ~RF_REFUND_WAIT) | RF_REFUNDED;
+    saveRefunds(); saveRentals(); telemetryDirty = true;
+    addLog("💸 โอนคืนแล้ว #" + String(r.id) + " " + String(amt) + " บาท" + (hasBank ? String(" → ") + q.to.code + " " + q.to.acct : String(" (") + ref + ")"));
+    sendOk("บันทึกแล้ว: โอนคืน " + String(amt) + " บาท"); return;
   } else if (act == "forfeit") {      // ตรวจแล้วกล้องชำรุด/เสียหาย: ไม่คืนมัดจำทั้งสิ้น
     if (r.status != RS_RETURNED && r.status != RS_ACTIVE) { sendErr(409, "ใช้ได้กับรายการที่รับกล้องไปแล้ว"); return; }
     if (r.flags & RF_REFUNDED) { sendErr(409, "คืนมัดจำไปแล้ว"); return; }
+    if (r.flags & RF_REFUND_WAIT) { r.flags &= ~RF_REFUND_WAIT; rqClear(i); saveRefunds(); }   // เปลี่ยนใจก่อนโอน
     r.flags |= RF_FORFEIT | RF_REFUNDED;
     addLog("⚠ ยึดมัดจำ #" + String(r.id) + " (กล้องชำรุด/เสียหาย)");
   } else if (act == "lost") {         // ไม่คืนกล้อง: ยึดมัดจำ
@@ -1454,7 +1623,9 @@ void handleAdminRental() {
     addLog("⚠ ไม่คืนกล้อง #" + String(r.id) + " ยึดมัดจำ");
   } else if (act == "delete") {
     if (r.status == RS_ACTIVE || r.status == RS_READY) { sendErr(409, "ลบไม่ได้ รายการยังไม่จบ"); return; }
+    if (r.flags & RF_REFUND_WAIT) { sendErr(409, "ลบไม่ได้ ยังค้างโอนเงินคืนผู้เช่า"); return; }
     if (r.status == RS_AWAIT || r.status == RS_VERIFY) freeCam = true;
+    if (rq[i].st != RQ_NONE) { rqClear(i); saveRefunds(); }
     uint16_t id = r.id; uint8_t cam = r.cam;
     deleteEvidence(id);
     memset(&r, 0, sizeof(Rental));
@@ -1535,8 +1706,10 @@ void handleAdminUser() {
     setPassword(u, p); dropSessionsOf(idx);
   } else if (act == "delete") {
     if (openRentalOf(idx) >= 0) { sendErr(409, "สมาชิกมีรายการเช่าค้างอยู่"); return; }
+    for (auto &x : rentals) if (x.status != RS_EMPTY && x.user == idx && (x.flags & RF_REFUND_WAIT)) { sendErr(409, "สมาชิกยังมีเงินรอโอนคืน"); return; }
+    if (wd[idx].st == WD_PENDING) { sendErr(409, "สมาชิกมีคำขอถอนเงินรออยู่"); return; }
     dropSessionsOf(idx); deletePhotos(idx); addLog(String("ลบสมาชิก: ") + u.sid);
-    wallet[idx] = 0; saveWallet(); memset(&wd[idx], 0, sizeof(Withdraw)); saveWithdrawals();
+    wallet[idx] = 0; saveWallet(); memset(&wd[idx], 0, sizeof(Withdraw)); saveWithdrawals(); memset(&bank[idx], 0, sizeof(BankAcct)); saveBanks();
     if (fsOk) LittleFS.remove(avatarPath(idx)); avPh[idx] = 0; savePhotoVersions();
     memset(&u, 0, sizeof(User)); saveUsers(); sendOk("ลบแล้ว"); return;
   } else { sendErr(400, "คำสั่งไม่ถูกต้อง"); return; }
@@ -1745,7 +1918,7 @@ const Route ROUTES[] = {
   {"verifyUpload", handleVerifyUpload}, {"verifySubmit", handleVerifySubmit}, {"adminUserPhoto", handleAdminUserPhoto},           {"register", handleRegister},       {"login", handleLogin},
   {"logout", handleLogout},           {"me", handleMe},                   {"rent", handleRent},
   {"pay", handlePayNotify},           {"paySlip", handlePaySlip},
-  {"payWallet", handlePayWallet}, {"withdraw", handleWithdraw}, {"withdrawCancel", handleWithdrawCancel}, {"adminWithdrawals", handleAdminWithdrawals}, {"adminWithdraw", handleAdminWithdraw},     {"topupSlip", handleTopupSlip},     {"camPhoto", handleCamPhoto},
+  {"payWallet", handlePayWallet}, {"withdraw", handleWithdraw}, {"bankSave", handleBankSave}, {"adminRefunds", handleAdminRefunds}, {"withdrawCancel", handleWithdrawCancel}, {"adminWithdrawals", handleAdminWithdrawals}, {"adminWithdraw", handleAdminWithdraw},     {"topupSlip", handleTopupSlip},     {"camPhoto", handleCamPhoto},
   {"adminCamPhoto", handleAdminCamPhoto}, {"avatarUpload", handleAvatarUpload}, {"avatar", handleAvatar},           {"cancel", handleCancel},           {"open", handleOpen},
   {"extend", handleExtend},           {"password", handlePassword},
   {"adminOverview", handleAdminOverview}, {"adminUnlock", handleAdminUnlock}, {"adminRental", handleAdminRental},
@@ -1755,19 +1928,20 @@ const Route ROUTES[] = {
 
 uint32_t lastHeartbeat = 0;
 void publishTelemetry() {
-  int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0, pendWd = 0;
+  int avail = 0, total = 0, active = 0, overdue = 0, ready = 0, pendPay = 0, refund = 0, members = 0, pendId = 0, pendWd = 0, rfWait = 0;
   uint32_t ep = nowEpoch();
   for (auto &c : cams) if (c.used) { total++; if (c.status == CAM_AVAILABLE) avail++; }
   for (auto &r : rentals) {
     if (r.status == RS_ACTIVE) { active++; if (ep && r.dueAt && ep > r.dueAt) overdue++; }
     if (r.status == RS_READY) ready++;
     if (r.status == RS_VERIFY || ((r.flags & RF_PAY_NOTIFIED) && r.paid < r.amount)) pendPay++;
-    if (r.status == RS_RETURNED && !(r.flags & RF_REFUNDED) && r.deposit) refund++;
+    if (r.status == RS_RETURNED && !(r.flags & (RF_REFUNDED | RF_REFUND_WAIT)) && r.deposit) refund++;
+    if (r.status != RS_EMPTY && (r.flags & RF_REFUND_WAIT)) rfWait++;
   }
   for (auto &u : users) if (u.flags & UF_USED) { members++; if (u.verify == VF_PENDING) pendId++; }
   for (int i = 0; i < MAX_USERS; i++) if ((users[i].flags & UF_USED) && wd[i].st == WD_PENDING) pendWd++;
   String j = "{\"activeCount\":" + String(active) + ",\"overdueCount\":" + String(overdue) + ",\"readyCount\":" + String(ready) +
-             ",\"pendingPay\":" + String(pendPay) + ",\"pendingVerify\":" + String(pendId) + ",\"refundPending\":" + String(refund) + ",\"withdrawPending\":" + String(pendWd) +
+             ",\"pendingPay\":" + String(pendPay) + ",\"pendingVerify\":" + String(pendId) + ",\"refundPending\":" + String(refund) + ",\"withdrawPending\":" + String(pendWd) + ",\"refundWait\":" + String(rfWait) +
              ",\"members\":" + String(members) + ",\"doorOpen\":" + String(jbool(!doorClosed)) + ",\"lockActive\":" + jbool(relayActive) +
              ",\"alarm\":" + jbool(doorAlarm) + ",\"returning\":" + jbool(returningIdx >= 0) +
              ",\"available\":" + String(avail) + ",\"camCount\":" + String(total) +
