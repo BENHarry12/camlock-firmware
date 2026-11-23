@@ -54,7 +54,7 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "3.1.0"
+#define FW_VERSION        "3.2.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 // บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
@@ -1046,40 +1046,159 @@ void slipFail(int i, const String &msg) {
   }
 }
 
+// ===================== EasySlip (เรียก API ตรวจสลิป) =====================
+// เอกสาร: https://document.easyslip.com  ฐาน URL = https://api.easyslip.com/v1
+// คืนค่า HTTP code (>0) หรือรหัสผิดพลาดของ HTTPClient (<0) และใส่เนื้อหาใน body
+int easySlipGet(const String &path, String &body) {
+  body = "";
+  WiFiClientSecure tls;
+  tls.setInsecure();                        // บอร์ดไม่มีที่เก็บ CA แต่ข้อมูลยังเข้ารหัส TLS
+  HTTPClient http;
+  http.setReuse(false);
+  http.useHTTP10(true);                     // ไม่ใช้ chunked encoding อ่านง่ายและไม่ขาดกลางทาง
+  http.setTimeout(12000);
+  http.setConnectTimeout(8000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("CamLock/" FW_VERSION);
+  String url = String("https://api.easyslip.com/v1") + path;
+  if (!http.begin(tls, url)) return -100;
+  http.addHeader("Authorization", "Bearer " + easySlipKey());
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity"); // ห้ามบีบอัด (gzip) บอร์ดถอดไม่ได้
+  int code = http.GET();
+  esp_task_wdt_reset();
+  if (code > 0) {
+    // อ่านเองทีละก้อน รองรับทั้งมี/ไม่มี Content-Length
+    WiFiClient *st = http.getStreamPtr();
+    int want = http.getSize();              // -1 = ไม่รู้ขนาด อ่านจนปิดการเชื่อมต่อ
+    unsigned long last = millis();
+    char buf[257];
+    while (st && (want < 0 || (int)body.length() < want) && millis() - last < 8000) {
+      int a = st->available();
+      if (a > 0) {
+        int n = st->readBytes(buf, a > 256 ? 256 : a);
+        buf[n] = 0; body += buf; last = millis();
+        if (body.length() > 16000) break;   // กันหน่วยความจำเต็ม
+      } else if (!st->connected()) break;
+      else delay(5);
+      esp_task_wdt_reset();
+    }
+  }
+  http.end();
+  return code;
+}
+
+String easySlipNetErr(int code) {
+  switch (code) {
+    case -100: return "เริ่มการเชื่อมต่อไม่ได้";
+    case -1: return "ต่อเซิร์ฟเวอร์ไม่ติด";
+    case -4: return "ไม่ได้เชื่อมต่อ";
+    case -5: return "การเชื่อมต่อหลุด";
+    case -11: return "หมดเวลารอ";
+    default: return "รหัส " + String(code);
+  }
+}
+
+// ตัดส่วนที่ไม่ใช่ JSON ทิ้ง แล้วแปลงเป็น JSON (เก็บเฉพาะฟิลด์ที่ใช้ ประหยัด RAM)
+// คืน "" ถ้าสำเร็จ หรือข้อความบอกสาเหตุ
+String easySlipParse(String &body, JsonDocument &d) {
+  int a = body.indexOf('{'), b = body.lastIndexOf('}');
+  if (a < 0 || b < a) return body.length() ? "ไม่ใช่ JSON " + String(body.length()) + " ไบต์" : "ไม่มีข้อมูลตอบกลับ";
+  if (a > 0 || b < (int)body.length() - 1) body = body.substring(a, b + 1);
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument f;
+#else
+  StaticJsonDocument<768> f;
+#endif
+  f["status"] = true; f["message"] = true;
+  f["data"]["transRef"] = true; f["data"]["date"] = true;
+  f["data"]["amount"]["amount"] = true;
+  f["data"]["receiver"]["account"]["name"]["th"] = true;
+  f["data"]["receiver"]["account"]["name"]["en"] = true;
+  f["data"]["receiver"]["account"]["proxy"]["account"] = true;
+  f["data"]["receiver"]["account"]["bank"]["account"] = true;
+  f["data"]["application"] = true; f["data"]["remainingQuota"] = true; f["data"]["usedQuota"] = true;
+  f["data"]["maxQuota"] = true; f["data"]["expiredAt"] = true;
+  DeserializationError e = deserializeJson(d, body, DeserializationOption::Filter(f));
+  if (e) return String("JSON ") + e.c_str();
+  if (!d.is<JsonObject>()) return "JSON ไม่ใช่ object";
+  return "";
+}
+
+String easySlipMsgTh(const String &m, int st) {
+  if (m == "slip_not_found") return "ไม่พบสลิปนี้ในระบบธนาคาร (สลิปปลอม หรือเพิ่งโอน ลองใหม่ใน 1-2 นาที)";
+  if (m == "slip_pending") return "ธนาคารยังไม่ยืนยันสลิปนี้ (สลิปกรุงเทพฯ ต้องรอประมาณ 5 นาที) ลองใหม่อีกครั้ง";
+  if (m == "invalid_payload") return "อ่าน QR บนสลิปไม่ถูกต้อง ลองถ่าย/เลือกรูปสลิปที่ชัดขึ้น";
+  if (m == "invalid_image" || m == "image_size_too_large") return "รูปสลิปไม่ถูกต้อง";
+  if (m == "duplicate_slip") return "สลิปนี้ถูกใช้ไปแล้ว";
+  if (m == "quota_exceeded") return "โควตา EasySlip หมด แจ้งผู้ดูแล";
+  if (m == "unauthorized") return "API key ของ EasySlip ไม่ถูกต้อง แจ้งผู้ดูแล";
+  if (m == "access_denied") return "บัญชี EasySlip ไม่อนุญาตให้ใช้งาน แจ้งผู้ดูแล";
+  if (m == "application_expired" || m == "application_deactivated") return "บัญชี EasySlip หมดอายุ แจ้งผู้ดูแล";
+  if (m == "server_error" || m == "api_server_error" || st >= 500) return "เซิร์ฟเวอร์ธนาคาร/EasySlip ขัดข้องชั่วคราว ลองใหม่ใน 1 นาที";
+  return "EasySlip ตอบว่า " + m + " (" + String(st) + ")";
+}
+
+// RPC ผู้ดูแล: ทดสอบการเชื่อม EasySlip ด้วย /me (ไม่เสียโควตา) ดูโควตาที่เหลือ
+void handleAdminEasySlipTest() {
+  if (requireAdmin() < 0) return;
+  if (!easySlipKey().length()) { sendErr(503, "ยังไม่ได้ใส่ API key ของ EasySlip"); return; }
+  if (WiFi.status() != WL_CONNECTED) { sendErr(503, "ตู้ไม่มีอินเทอร์เน็ต"); return; }
+  String body; int code = easySlipGet("/me", body);
+  Serial.printf("[EasySlip] me HTTP %d: %.160s\n", code, body.c_str());
+  if (code <= 0) { sendErr(502, "เชื่อม EasySlip ไม่ได้ (" + easySlipNetErr(code) + ")"); return; }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument d;
+#else
+  DynamicJsonDocument d(2048);
+#endif
+  String perr = easySlipParse(body, d);
+  if (perr.length()) { sendErr(502, "HTTP " + String(code) + " " + perr); return; }
+  int st = d["status"] | code;
+  if (st != 200) { sendErr(502, easySlipMsgTh(d["message"] | "error", st)); return; }
+  JsonVariant dt = d["data"];
+  String app = dt["application"] | "";
+  long rem = dt["remainingQuota"] | -1L, used = dt["usedQuota"] | -1L, mx = dt["maxQuota"] | -1L;
+  String exp = dt["expiredAt"] | "";
+  sendJson(200, "{\"ok\":true,\"msg\":" + jstr("EasySlip ใช้งานได้ · " + app + " · เหลือ " + String(rem) + "/" + String(mx) + " ครั้ง") +
+                ",\"remaining\":" + String(rem) + ",\"used\":" + String(used) + ",\"max\":" + String(mx) + ",\"expiredAt\":" + jstr(exp) + "}");
+}
+
 void processSlipJob() {
   if (slipJob < 0) return;
   int i = slipJob; slipJob = -1; curSlipKind = slipJobKind;
   Rental &r = rentals[curSlipKind == 1 ? 0 : i];
   if (WiFi.status() != WL_CONNECTED) { slipFail(i, "ตู้ไม่มีอินเทอร์เน็ต ลองใหม่อีกครั้ง"); telemetryDirty = true; return; }
   esp_task_wdt_reset();
-  WiFiClientSecure tls; tls.setInsecure();   // ไม่ตรวจใบรับรอง (บอร์ดไม่มีที่เก็บ CA) ข้อมูลยังเข้ารหัสอยู่
-  HTTPClient http; http.setTimeout(8000); http.setConnectTimeout(6000);
-  String url = "https://developer.easyslip.com/api/v1/verify?payload=" + urlEncode(slipPayload);
-  if (!http.begin(tls, url)) { slipFail(i, "เชื่อม EasySlip ไม่ได้"); return; }
-  http.addHeader("Authorization", "Bearer " + easySlipKey());
-  int code = http.GET();
-  esp_task_wdt_reset();
-  String body = code > 0 ? http.getString() : "";
-  http.end();
-  esp_task_wdt_reset();
-  if (code <= 0) { slipFail(i, "เชื่อม EasySlip ไม่ได้ (" + String(code) + ")"); telemetryDirty = true; return; }
+  String body; int code = 0;
+  String path = "/verify?payload=" + urlEncode(slipPayload);
+  for (int attempt = 0; attempt < 2; attempt++) {          // ลอง 2 ครั้ง กันเน็ตสะดุด
+    code = easySlipGet(path, body);
+    esp_task_wdt_reset();
+    if (code > 0 && body.indexOf('{') >= 0) break;
+    delay(400);
+  }
+  Serial.printf("[EasySlip] verify HTTP %d, %u bytes: %.160s\n", code, body.length(), body.c_str());
+  if (code <= 0) { slipFail(i, "เชื่อม EasySlip ไม่ได้ (" + easySlipNetErr(code) + ") ลองใหม่อีกครั้ง"); telemetryDirty = true; return; }
 
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument d;
 #else
-  DynamicJsonDocument d(4096);
+  DynamicJsonDocument d(6144);
 #endif
-  if (deserializeJson(d, body)) { slipFail(i, "คำตอบจาก EasySlip ไม่ถูกต้อง (HTTP " + String(code) + ")"); telemetryDirty = true; return; }
-  if (code != 200 || (d["status"] | 0) != 200) {
+  String perr = easySlipParse(body, d);
+  if (perr.length()) {
+    String why = code >= 500 ? "เซิร์ฟเวอร์ EasySlip ขัดข้องชั่วคราว ลองใหม่ใน 1 นาที" :
+                 code == 401 || code == 403 ? "API key ของ EasySlip ไม่ถูกต้อง แจ้งผู้ดูแล" :
+                 code == 429 ? "ส่งสลิปถี่เกินไป รอสักครู่แล้วลองใหม่" :
+                 "คำตอบจาก EasySlip อ่านไม่ได้";
+    slipFail(i, why + " [HTTP " + String(code) + ", " + perr + "]");
+    telemetryDirty = true; return;
+  }
+  int st = d["status"] | code;
+  if (st != 200) {
     String m = d["message"] | "error";
-    String th = m == "slip_not_found" ? "ไม่พบสลิปนี้ในระบบธนาคาร (สลิปปลอมหรือเพิ่งโอน ลองใหม่ใน 1 นาที)" :
-                m == "invalid_payload" ? "QR บนสลิปไม่ถูกต้อง" :
-                m == "duplicate_slip" ? "สลิปนี้ถูกใช้ไปแล้ว" :
-                m == "quota_exceeded" ? "โควตา EasySlip หมด แจ้งผู้ดูแล" :
-                m == "unauthorized" ? "API key ของ EasySlip ไม่ถูกต้อง แจ้งผู้ดูแล" :
-                m == "application_expired" || m == "application_deactivated" ? "บัญชี EasySlip หมดอายุ แจ้งผู้ดูแล" :
-                "EasySlip ตอบว่า " + m;
-    slipFail(i, th); telemetryDirty = true; return;
+    slipFail(i, easySlipMsgTh(m, st)); telemetryDirty = true; return;
   }
   JsonVariant dt = d["data"];
   String ref = dt["transRef"] | "";
@@ -1545,7 +1664,7 @@ const Route ROUTES[] = {
   {"extend", handleExtend},           {"password", handlePassword},
   {"adminOverview", handleAdminOverview}, {"adminUnlock", handleAdminUnlock}, {"adminRental", handleAdminRental},
   {"adminCamera", handleAdminCamSave},    {"adminCameraDelete", handleAdminCamDelete}, {"adminUser", handleAdminUser},
-  {"adminSettings", handleAdminSettings}, {"adminSettingsSave", handleAdminSettingsSave}, {"adminLog", handleAdminLog},
+  {"adminSettings", handleAdminSettings}, {"adminEasySlipTest", handleAdminEasySlipTest}, {"adminSettingsSave", handleAdminSettingsSave}, {"adminLog", handleAdminLog},
 };
 
 uint32_t lastHeartbeat = 0;
