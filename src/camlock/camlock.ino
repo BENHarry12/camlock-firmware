@@ -44,7 +44,7 @@
 #define HAS_REED_SWITCH   0
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.6.0"
+#define FW_VERSION        "2.7.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
 #define TZ_INFO           "ICT-7"
@@ -1242,24 +1242,84 @@ void onMqttMessage(char *topic, byte *payload, unsigned int len) {
 uint32_t lastWifiTry = 0, lastMqttTry = 0, lastTelemetry = 0;
 bool wifiWasUp = false, ntpStarted = false;
 
+// เหตุผลที่ WiFi หลุด (จาก event ของ ESP32) ใช้บอกใน Serial ว่าต้องแก้ตรงไหน
+volatile uint16_t wifiReason = 0;
+uint32_t wifiDownSince = 0, mqttDownSince = 0;
+uint8_t  wifiTries = 0;
+
+const char *wifiReasonText(uint16_t r) {
+  switch (r) {
+    case 201: return "หา WiFi ไม่เจอ (ชื่อผิด, อยู่ไกล หรือเป็น 5GHz — ESP32 ใช้ได้แค่ 2.4GHz)";
+    case 202: case 15: case 204: return "รหัสผ่าน WiFi ไม่ถูกต้อง";
+    case 203: return "เชื่อมต่อไม่สำเร็จ (เราเตอร์ปฏิเสธ)";
+    case 8:   return "ออกจาก WiFi";
+    case 200: return "สัญญาณหาย (beacon timeout)";
+    default:  return "หลุดการเชื่อมต่อ";
+  }
+}
+
+void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  wifiReason = info.wifi_sta_disconnected.reason;
+}
+
+void startWifi(bool hardReset) {
+  if (hardReset) { WiFi.disconnect(true); delay(200); WiFi.mode(WIFI_STA); WiFi.setSleep(false); }
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("กำลังต่อ WiFi \"%s\" (ครั้งที่ %u)...\n", WIFI_SSID, (unsigned)wifiTries + 1);
+  wifiTries++;
+}
+
+// ไล่ดูว่ามองเห็น WiFi ที่ตั้งไว้ไหม ช่วยบอกสาเหตุใน Serial Monitor
+void diagnoseWifi() {
+  esp_task_wdt_reset();
+  int n = WiFi.scanNetworks();
+  esp_task_wdt_reset();
+  bool found = false;
+  for (int i = 0; i < n; i++) if (WiFi.SSID(i) == WIFI_SSID) {
+    found = true;
+    Serial.printf("  เห็น \"%s\" สัญญาณ %d dBm ช่อง %d\n", WIFI_SSID, WiFi.RSSI(i), WiFi.channel(i));
+  }
+  if (!found) Serial.printf("  ไม่เห็น WiFi \"%s\" เลย (เปิดฮอตสปอตหรือยัง? ต้องเป็น 2.4GHz / iPhone เปิด Maximize Compatibility)\n", WIFI_SSID);
+  WiFi.scanDelete();
+}
+
 void maintainNetwork() {
   uint32_t now = millis();
   if (WiFi.status() != WL_CONNECTED) {
-    if (wifiWasUp) { wifiWasUp = false; addLog("WiFi หลุด"); }
-    if (now - lastWifiTry > 15000 || lastWifiTry == 0) {
+    if (wifiWasUp) {
+      wifiWasUp = false; wifiDownSince = now;
+      addLog(String("WiFi หลุด: ") + wifiReasonText(wifiReason) + " กำลังเชื่อมใหม่");
+      telemetryDirty = true;
+    }
+    if (!wifiDownSince) wifiDownSince = now;
+    // ครั้งแรกเริ่มต่อเลย จากนั้นให้เวลาแต่ละครั้ง 20 วินาที (ESP32 ต่อใหม่เองด้วย autoReconnect)
+    if (lastWifiTry == 0 || now - lastWifiTry > 20000) {
+      if (lastWifiTry) {
+        Serial.printf("WiFi ยังไม่ติด: %s (reason %u)\n", wifiReasonText(wifiReason), (unsigned)wifiReason);
+        if (wifiTries % 3 == 0) diagnoseWifi();
+      }
       lastWifiTry = now;
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
-      Serial.printf("กำลังต่อ WiFi %s ...\n", WIFI_SSID);
+      startWifi(wifiTries > 0 && wifiTries % 3 == 0);   // ทุก 3 รอบ รีเซ็ต WiFi ใหม่หมด
+    }
+    // หลุดนานเกิน 10 นาที รีสตาร์ทบอร์ด (ยกเว้นตอนกลอนเปิดอยู่)
+    if (now - wifiDownSince > 600000UL && !relayActive && returningIdx < 0) {
+      Serial.println("WiFi หลุดนานเกิน 10 นาที รีสตาร์ทบอร์ด");
+      delay(200); ESP.restart();
     }
     return;
   }
+  wifiDownSince = 0; wifiTries = 0;
   if (!wifiWasUp) {
     wifiWasUp = true;
     addLog("เชื่อม WiFi " WIFI_SSID " IP " + WiFi.localIP().toString());
     if (!ntpStarted) { configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com", "time.navy.mi.th"); ntpStarted = true; }
   }
   if (!mqtt.connected()) {
+    if (!mqttDownSince) mqttDownSince = now;
+    if (now - mqttDownSince > 600000UL && !relayActive && returningIdx < 0) {   // ต่อ ThingsBoard ไม่ได้ 10 นาที รีสตาร์ท
+      Serial.println("ต่อ ThingsBoard ไม่ได้นานเกิน 10 นาที รีสตาร์ทบอร์ด");
+      delay(200); ESP.restart();
+    }
     if (now - lastMqttTry < 5000 && lastMqttTry != 0) return;
     lastMqttTry = now;
     String clientId = "camlock-" + String((uint32_t)ESP.getEfuseMac(), HEX);
@@ -1268,10 +1328,13 @@ void maintainNetwork() {
     if (mqtt.connect(clientId.c_str(), TB_TOKEN, NULL)) {      // username = access token
       mqtt.subscribe("v1/devices/me/rpc/request/+");
       addLog("เชื่อม ThingsBoard แล้ว");
+      mqttDownSince = 0;
       publishAttributes();
       publishTelemetry();
     } else {
-      Serial.printf("ต่อ ThingsBoard ไม่ได้ (state %d) เช็ค TB_TOKEN\n", mqtt.state());
+      int st = mqtt.state();
+      Serial.printf("ต่อ ThingsBoard ไม่ได้ (state %d) %s\n", st,
+        st == 4 || st == 5 ? "— TB_TOKEN ไม่ถูกต้อง" : st == -2 ? "— ออกเน็ตไม่ได้ (WiFi ไม่มีอินเทอร์เน็ต?)" : "");
     }
     return;
   }
@@ -1316,9 +1379,12 @@ void setup() {
   doorOpenedAt = millis();
   addLog(String("เปิดเครื่อง ประตู") + (doorClosed ? "ปิดอยู่" : "เปิดอยู่"));
 
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("camlock");
+  WiFi.setSleep(false);                 // ปิดโหมดประหยัดไฟ ลดการหลุด
   WiFi.setAutoReconnect(true);
+  WiFi.onEvent(onWifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   mqtt.setServer(TB_HOST, TB_PORT);
   mqtt.setCallback(onMqttMessage);
   mqtt.setBufferSize(MQTT_BUFFER);
