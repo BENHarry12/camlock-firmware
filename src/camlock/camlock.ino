@@ -54,9 +54,12 @@
 #define SHOP_PP_NAME      "ภานุวัฒน์ ลิ้มประยูร (Panuwat Limprayoon)"
 /* ---------------------------------- */
 
-#define FW_VERSION        "2.8.1"
+#define FW_VERSION        "2.9.0"
 #define ADMIN_SID         "admin"
 #define ADMIN_DEFAULT_PW  "1234"
+// บัญชีทดสอบ (ระบบจำลอง): เช่าได้เลย ไม่ต้องยืนยันตัวตน ไม่ต้องชำระเงิน — กลอนเปิดจริง
+#define TEST_SID          "testcam"
+#define TEST_PW           "testcam"
 #define TZ_INFO           "ICT-7"
 
 #define PIN_RELAY         26
@@ -86,7 +89,7 @@
 #define MQTT_BUFFER       49152     // คำตอบ RPC ใหญ่สุด (รายการผู้ดูแล) ต้องพอดีบัฟเฟอร์นี้
 
 // ---------- โครงสร้างข้อมูล (ต้องอยู่ก่อนฟังก์ชันแรก เพราะ Arduino IDE สร้าง prototype ไว้ตรงนั้น) ----------
-enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4 };
+enum UserFlag   : uint8_t { UF_USED = 1, UF_ADMIN = 2, UF_DISABLED = 4, UF_TEST = 8 };
 enum CamStatus  : uint8_t { CAM_AVAILABLE = 0, CAM_RENTED = 1, CAM_MAINT = 2 };
 enum RentStatus : uint8_t { RS_EMPTY = 0, RS_AWAIT = 1, RS_VERIFY = 2, RS_READY = 3, RS_ACTIVE = 4, RS_RETURNED = 5, RS_CANCELLED = 6 };
 enum RentFlag   : uint8_t { RF_REFUNDED = 1, RF_PAY_NOTIFIED = 2, RF_PHOTO_PICK = 4, RF_PHOTO_RET = 8 };
@@ -409,6 +412,17 @@ void loadAll() {
     a.flags = UF_USED | UF_ADMIN; a.verify = VF_OK; setPassword(a, ADMIN_DEFAULT_PW);
     saveUsers();
   }
+  // บัญชีทดสอบ: สร้างให้ถ้ายังไม่มี (ลบในแอปแล้วรีสตาร์ทบอร์ดจะกลับมา)
+  bool hasTest = false;
+  for (auto &u : users) if ((u.flags & UF_USED) && strcmp(u.sid, TEST_SID) == 0) { hasTest = true; if (!(u.flags & UF_TEST)) { u.flags |= UF_TEST; saveUsers(); } }
+  if (!hasTest) {
+    for (auto &t : users) if (!(t.flags & UF_USED)) {
+      memset(&t, 0, sizeof(User));
+      copyStr(t.sid, sizeof(t.sid), TEST_SID); copyStr(t.name, sizeof(t.name), "บัญชีทดสอบ (ไม่ต้องชำระเงิน)");
+      t.flags = UF_USED | UF_TEST; t.verify = VF_OK; setPassword(t, TEST_PW);
+      saveUsers(); break;
+    }
+  }
   if (!hasCams) {    // ครั้งแรก: ใส่กล้องตัวอย่าง แก้/ลบได้ในหน้าผู้ดูแล
     seedCamera(0, "Canon EOS R50", "RF-S 18-45mm", "APS-C 24.2MP|4K 30p|375 g", 60, 3000);
     seedCamera(1, "Sony ZV-E10", "E 16-50mm", "APS-C 24.2MP|4K 24p|343 g", 55, 3000);
@@ -629,7 +643,7 @@ String userJson(int i) {
   }
   return "{\"idx\":" + String(i) + ",\"sid\":" + jstr(u.sid) + ",\"name\":" + jstr(u.name) + ",\"phone\":" + jstr(u.phone) +
          ",\"studentId\":" + jstr(u.studentId) + ",\"verify\":\"" + verifyName(u.verify) + "\"" +
-         ",\"admin\":" + jbool(u.flags & UF_ADMIN) + ",\"disabled\":" + jbool(u.flags & UF_DISABLED) +
+         ",\"admin\":" + jbool(u.flags & UF_ADMIN) + ",\"disabled\":" + jbool(u.flags & UF_DISABLED) + ",\"test\":" + jbool(u.flags & UF_TEST) +
          ",\"created\":" + String(u.created) + ",\"rentals\":" + String(count) + ",\"hours\":" + String(hrs) + ",\"late\":" + String(late) + "}";
 }
 String camJson(int i) {
@@ -784,7 +798,8 @@ void handleMe() {
 void handleRent() {
   int u = requireUser(); if (u < 0) return;
   if (!timeSynced()) { sendErr(503, "ตู้ยังไม่ได้ตั้งเวลา ลองรีเฟรชหน้าแล้วลองใหม่"); return; }
-  if (!(users[u].flags & UF_ADMIN) && users[u].verify != VF_OK) {
+  bool isTest = users[u].flags & UF_TEST;
+  if (!(users[u].flags & UF_ADMIN) && !isTest && users[u].verify != VF_OK) {
     sendErr(403, users[u].verify == VF_PENDING ? "รอผู้ดูแลตรวจการยืนยันตัวตน" : "กรุณายืนยันตัวตนก่อนเช่า"); return;
   }
   if (openRentalOf(u) >= 0) { sendErr(409, "คุณมีรายการเช่าที่ยังไม่จบอยู่แล้ว"); return; }
@@ -809,13 +824,13 @@ void handleRent() {
   deleteEvidence(r.id);          // ทับรายการเก่า: ลบรูปหลักฐานของรายการนั้นด้วย
   memset(&r, 0, sizeof(Rental));
   r.id = nextRentalId++; r.user = u; r.cam = cam; r.hours = hours;
-  r.price = c.price; r.deposit = c.deposit;
-  r.amount = (uint32_t)c.price * hours + c.deposit;
+  r.price = isTest ? 0 : c.price; r.deposit = isTest ? 0 : c.deposit;   // บัญชีทดสอบ: ยอด 0 ไม่ปนรายได้ ค่าปรับก็เป็น 0
+  r.amount = (uint32_t)r.price * hours + r.deposit;
   r.created = nowEpoch();
-  r.status = RS_AWAIT;
+  r.status = isTest ? RS_READY : RS_AWAIT;
   c.status = CAM_RENTED;
   saveRentals(); saveCams();
-  addLog("จอง #" + String(r.id) + " " + users[u].sid + " → " + c.name + " " + String(hours) + " ชม.");
+  addLog("จอง #" + String(r.id) + " " + users[u].sid + " → " + c.name + " " + String(hours) + " ชม." + (isTest ? " (ทดสอบ ข้ามการชำระเงิน)" : ""));
   sendJson(200, "{\"ok\":true,\"rental\":" + rentalJson(slot) + "}");
 }
 
@@ -1328,7 +1343,7 @@ void publishTelemetry() {
     if (r.status == RS_ACTIVE) { active++; if (ep && r.dueAt && ep > r.dueAt) overdue++; }
     if (r.status == RS_READY) ready++;
     if (r.status == RS_VERIFY || ((r.flags & RF_PAY_NOTIFIED) && r.paid < r.amount)) pendPay++;
-    if (r.status == RS_RETURNED && !(r.flags & RF_REFUNDED)) refund++;
+    if (r.status == RS_RETURNED && !(r.flags & RF_REFUNDED) && r.deposit) refund++;
   }
   for (auto &u : users) if (u.flags & UF_USED) { members++; if (u.verify == VF_PENDING) pendId++; }
   String j = "{\"activeCount\":" + String(active) + ",\"overdueCount\":" + String(overdue) + ",\"readyCount\":" + String(ready) +
